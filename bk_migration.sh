@@ -90,7 +90,7 @@ skipped=0
 
 for f in "${files[@]}"; do
   if ! grep -qE '^\s*-\s*stage:\s*synopsispolaris\s*$' "$f"; then
-    ((skipped++))
+    ((skipped++)) || true
     continue
   fi
 
@@ -101,7 +101,7 @@ for f in "${files[@]}"; do
     TARGET_STAGE="$TARGET_STAGE" REPL_STAGE_FILE="$STAGE_TMP" \
       "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
     echo "DRY RUN: would update $f"
-    ((updated++))
+    ((updated++)) || true
     continue
   fi
 
@@ -111,7 +111,7 @@ for f in "${files[@]}"; do
     "$YQ_BIN" e -i "$YQ_PROGRAM" "$f"
 
   echo "Updated. Backup saved: $f.bak"
-  ((updated++))
+  ((updated++)) || true
 done
 
 echo
