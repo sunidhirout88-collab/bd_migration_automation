@@ -5,7 +5,7 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-TARGET_STAGE="synopsispolaris"
+TARGET_STAGE="SynopsysPolaris"
 
 PIPELINE_PATTERNS=(
   -name "azure-pipelines.yml" -o
@@ -89,7 +89,7 @@ updated=0
 skipped=0
 
 for f in "${files[@]}"; do
-  if ! grep -qE '^\s*-\s*stage:\s*synopsispolaris\s*$' "$f"; then
+  if ! grep -qE '^\s*-\s*stage:\s*SynopsysPolaris\s*$' "$f"; then
     ((skipped++)) || true
     continue
   fi
