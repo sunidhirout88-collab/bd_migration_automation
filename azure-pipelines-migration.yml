@@ -1,24 +1,53 @@
-trigger: none # Manual run (recommended for audits)
-pr: none # Do not run on PR by default
+trigger: none
+pr: none
+
+parameters:
+- name: repoName
+  displayName: 'Repository (e.g., Org/Repo)'
+  type: string
+  default: 'my-org/my-repo'
+
+- name: branch
+  displayName: 'Branch (e.g., main)'
+  type: string
+  default: 'main'
+
+# If using GitHub, you must have a GitHub service connection created in Azure DevOps.
+# For Azure Repos, type can be 'git' and name format differs.
+resources:
+  repositories:
+  - repository: targetRepo
+    type: github
+    name: ${{ parameters.repoName }}
+    ref: refs/heads/${{ parameters.branch }}
+    endpoint: 'MyGitHubServiceConnection'
 
 pool:
   vmImage: ubuntu-latest
 
 steps:
-  # 1) Checkout the GitHub repo (this repo) to the agent
-  - checkout: self
-    fetchDepth: 1
+# Checkout THIS repo (where tools/bk_migration.sh exists)
+- checkout: self
+  fetchDepth: 1
 
-  # 2) Run the audit script with tracing
-  - bash: |
-      set -euo pipefail
-      cd "$(Build.SourcesDirectory)"
+# Checkout TARGET repo into a subfolder
+- checkout: targetRepo
+  fetchDepth: 1
+  path: target
 
-      echo "Listing tools folder:"
-      ls -la tools || true
+# Run your script; pass the checked out target path if your script supports it
+- bash: |
+    set -euo pipefail
 
-      echo "Make script executable..."
-      chmod +x tools/bk_migration.sh
+    echo "Self repo location: $(Build.SourcesDirectory)"
+    echo "Target repo location: $(Build.SourcesDirectory)/target"
+    echo "Target branch: ${{ parameters.branch }}"
 
-      echo "Run migration..."
-      bash -x ./tools/bk_migration.sh
+    echo "Listing tools folder in self repo:"
+    ls -la "$(Build.SourcesDirectory)/tools" || true
+
+    chmod +x "$(Build.SourcesDirectory)/tools/bk_migration.sh"
+
+    echo "Run migration against checked-out target repo..."
+    bash -x "$(Build.SourcesDirectory)/tools/bk_migration.sh" "$(Build.SourcesDirectory)/target"
+  displayName: "Run migration script"
