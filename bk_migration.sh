@@ -5,8 +5,8 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-# remove stage names containing this keyword (case-insensitive)
-STAGE_KEYWORD="synopsys"
+# Which task indicates "Polaris stage" (we replace any stage containing this task)
+POLARIS_TASK_REGEX='^SynopsysPolaris@'
 
 PIPELINE_PATTERNS=(
   -name "azure-pipelines.yml" -o
@@ -22,8 +22,8 @@ PIPELINE_PATTERNS=(
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }; }
 need_cmd "$YQ_BIN"
 need_cmd find
-need_cmd grep
 
+# Replacement stage content
 STAGE_TMP="$(mktemp)"
 cat > "$STAGE_TMP" <<'YAML'
 - stage: BlackduckCoverityOnPolaris
@@ -50,21 +50,35 @@ YAML
 cleanup() { rm -f "$STAGE_TMP"; }
 trap cleanup EXIT
 
-# yq logic: remove ALL stages whose name contains STAGE_KEYWORD (case-insensitive),
-# then insert replacement stage at the first removed index.
+# yq program:
+# - stage_has_polaris = stage contains any step with task matching POLARIS_TASK_REGEX
+# - remove all such stages and insert replacement stage at first removed stage index
 YQ_PROGRAM="$(cat <<'YQ'
-def is_target_stage(s): ((s.stage // "") | test(strenv(STAGE_KEYWORD); "i"));
+def stage_has_polaris:
+  any(
+    # Walk the stage object looking for "task" keys inside steps
+    (.. | select(tag == "!!map") | .task? // empty)
+    ;
+    test(strenv(POLARIS_TASK_REGEX))
+  );
 
 if (.stages? // null) == null then
   .
 else
   (.stages // []) as $st
-  | ($st | to_entries | map(select(.value | is_target_stage(.)))) as $matches
+  | ($st | to_entries | map(select(.value | stage_has_polaris))) as $matches
   | if ($matches | length) == 0 then
       .
     else
       ($matches[0].key) as $idx
-      | .stages = ($st | to_entries | map(select((.value | is_target_stage(.)) | not)) | map(.value))
+      # remove all stages containing SynopsysPolaris tasks
+      | .stages = (
+          $st
+          | to_entries
+          | map(select((.value | stage_has_polaris) | not))
+          | map(.value)
+        )
+      # insert replacement stage at original index
       | .stages = (.stages[:$idx] + load(strenv(REPL_STAGE_FILE)) + .stages[$idx:])
     end
 end
@@ -89,9 +103,11 @@ updated=0
 skipped=0
 
 for f in "${files[@]}"; do
-  # fast pre-check: stage line contains "synopsys" (case-insensitive), allow comments/CRLF
-  if ! grep -qiE $'^[[:space:]]*-[[:space:]]*stage:[[:space:]]*[^#\r]*synopsys[^#\r]*(#.*)?\r?$' "$f"; then
-    ((skipped++)) || true
+  # YAML-aware check: does this file have any stage containing SynopsysPolaris task?
+  if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
+      '(.stages // []) | any( (.. | select(tag=="!!map") | .task? // empty) | test(strenv(POLARIS_TASK_REGEX)) )' \
+      "$f" >/dev/null 2>&1; then
+    ((++skipped)) || true
     continue
   fi
 
@@ -99,20 +115,20 @@ for f in "${files[@]}"; do
   echo "Processing: $f"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    STAGE_KEYWORD="$STAGE_KEYWORD" REPL_STAGE_FILE="$STAGE_TMP" \
+    POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
       "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
     echo "DRY RUN: would update $f"
-    ((updated++)) || true
+    ((++updated)) || true
     continue
   fi
 
   cp -p "$f" "$f.bak"
 
-  STAGE_KEYWORD="$STAGE_KEYWORD" REPL_STAGE_FILE="$STAGE_TMP" \
+  POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
     "$YQ_BIN" e -i "$YQ_PROGRAM" "$f"
 
   echo "Updated. Backup saved: $f.bak"
-  ((updated++)) || true
+  ((++updated)) || true
 done
 
 echo
