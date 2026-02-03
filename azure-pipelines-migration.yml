@@ -33,6 +33,6 @@ steps:
     echo "Branch:  ${{ parameters.branch }}"
     git clone --depth 1 --branch "${{ parameters.branch }}" "${{ parameters.repoUrl }}" target
 
-    chmod +x /bk_migration.sh
+    chmod +x bk_migration.sh
     bash -x ./bk_migration.sh "$(Build.SourcesDirectory)/target"
   displayName: "Clone repo and run migration"
