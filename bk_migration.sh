@@ -5,7 +5,8 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-TARGET_STAGE="SynopsysPolaris"
+# remove stage names containing this keyword (case-insensitive)
+STAGE_KEYWORD="synopsys"
 
 PIPELINE_PATTERNS=(
   -name "azure-pipelines.yml" -o
@@ -18,9 +19,7 @@ PIPELINE_PATTERNS=(
   -path "*/.pipelines/*.yaml"
 )
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }; }
 need_cmd "$YQ_BIN"
 need_cmd find
 need_cmd grep
@@ -51,9 +50,10 @@ YAML
 cleanup() { rm -f "$STAGE_TMP"; }
 trap cleanup EXIT
 
-# ✅ FIX: use cat heredoc into variable instead of read -d ''
+# yq logic: remove ALL stages whose name contains STAGE_KEYWORD (case-insensitive),
+# then insert replacement stage at the first removed index.
 YQ_PROGRAM="$(cat <<'YQ'
-def is_target_stage(s): (s.stage // "") == strenv(TARGET_STAGE);
+def is_target_stage(s): ((s.stage // "") | test(strenv(STAGE_KEYWORD); "i"));
 
 if (.stages? // null) == null then
   .
@@ -89,7 +89,8 @@ updated=0
 skipped=0
 
 for f in "${files[@]}"; do
-  if ! grep -qE '^\s*-\s*stage:\s*SynopsysPolaris\s*$' "$f"; then
+  # fast pre-check: stage line contains "synopsys" (case-insensitive), allow comments/CRLF
+  if ! grep -qiE $'^[[:space:]]*-[[:space:]]*stage:[[:space:]]*[^#\r]*synopsys[^#\r]*(#.*)?\r?$' "$f"; then
     ((skipped++)) || true
     continue
   fi
@@ -98,7 +99,7 @@ for f in "${files[@]}"; do
   echo "Processing: $f"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    TARGET_STAGE="$TARGET_STAGE" REPL_STAGE_FILE="$STAGE_TMP" \
+    STAGE_KEYWORD="$STAGE_KEYWORD" REPL_STAGE_FILE="$STAGE_TMP" \
       "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
     echo "DRY RUN: would update $f"
     ((updated++)) || true
@@ -107,7 +108,7 @@ for f in "${files[@]}"; do
 
   cp -p "$f" "$f.bak"
 
-  TARGET_STAGE="$TARGET_STAGE" REPL_STAGE_FILE="$STAGE_TMP" \
+  STAGE_KEYWORD="$STAGE_KEYWORD" REPL_STAGE_FILE="$STAGE_TMP" \
     "$YQ_BIN" e -i "$YQ_PROGRAM" "$f"
 
   echo "Updated. Backup saved: $f.bak"
