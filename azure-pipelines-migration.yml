@@ -36,4 +36,3 @@ steps:
     chmod +x tools/bk_migration.sh
     bash -x ./tools/bk_migration.sh "$(Build.SourcesDirectory)/target"
   displayName: "Clone repo and run migration"
-``
