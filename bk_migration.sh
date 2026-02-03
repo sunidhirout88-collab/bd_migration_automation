@@ -5,10 +5,8 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-# exact stage name (as you confirmed)
 TARGET_STAGE="synopsispolaris"
 
-# pipeline file patterns
 PIPELINE_PATTERNS=(
   -name "azure-pipelines.yml" -o
   -name "azure-pipelines.yaml" -o
@@ -20,12 +18,13 @@ PIPELINE_PATTERNS=(
   -path "*/.pipelines/*.yaml"
 )
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }; }
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }
+}
 need_cmd "$YQ_BIN"
 need_cmd find
 need_cmd grep
 
-# Replacement stage content (valid Azure DevOps structure)
 STAGE_TMP="$(mktemp)"
 cat > "$STAGE_TMP" <<'YAML'
 - stage: BlackduckCoverityOnPolaris
@@ -52,11 +51,8 @@ YAML
 cleanup() { rm -f "$STAGE_TMP"; }
 trap cleanup EXIT
 
-# yq logic:
-# 1) find index of stage where .stage == "synopsispolaris"
-# 2) remove all occurrences of that stage
-# 3) insert replacement stage at original index
-read -r -d '' YQ_PROGRAM <<'YQ'
+# ✅ FIX: use cat heredoc into variable instead of read -d ''
+YQ_PROGRAM="$(cat <<'YQ'
 def is_target_stage(s): (s.stage // "") == strenv(TARGET_STAGE);
 
 if (.stages? // null) == null then
@@ -73,6 +69,7 @@ else
     end
 end
 YQ
+)"
 
 echo "Scanning: $ROOT_DIR"
 echo "DRY_RUN=$DRY_RUN"
@@ -92,7 +89,6 @@ updated=0
 skipped=0
 
 for f in "${files[@]}"; do
-  # fast exact match check (as per your confirmation)
   if ! grep -qE '^\s*-\s*stage:\s*synopsispolaris\s*$' "$f"; then
     ((skipped++))
     continue
@@ -102,7 +98,8 @@ for f in "${files[@]}"; do
   echo "Processing: $f"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    TARGET_STAGE="$TARGET_STAGE" REPL_STAGE_FILE="$STAGE_TMP" "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
+    TARGET_STAGE="$TARGET_STAGE" REPL_STAGE_FILE="$STAGE_TMP" \
+      "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
     echo "DRY RUN: would update $f"
     ((updated++))
     continue
