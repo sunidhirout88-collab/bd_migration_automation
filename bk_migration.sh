@@ -5,7 +5,7 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-# Which task indicates "Polaris task" (we replace any stage containing this task)
+# Which task indicates "Polaris task"
 POLARIS_TASK_REGEX='^SynopsysPolaris@'
 
 PIPELINE_PATTERNS=(
@@ -19,9 +19,7 @@ PIPELINE_PATTERNS=(
   -path "*/.pipelines/*.yaml"
 )
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }; }
 need_cmd "$YQ_BIN"
 need_cmd find
 
@@ -52,22 +50,16 @@ YAML
 cleanup() { rm -f "$STAGE_TMP"; }
 trap cleanup EXIT
 
-# yq program:
-# 1) If .stages exists: remove all stages containing Polaris task and insert replacement stage at first match index
-# 2) Else if .steps exists: convert to stages pipeline:
-#    - split steps into LegacyPre (before first Polaris) + LegacyPost (after first Polaris)
-#    - remove Polaris steps from both
-#    - insert replacement stage between them
 YQ_PROGRAM="$(cat <<'YQ'
 def task_matches:
   ((.task? // "") | test(strenv(POLARIS_TASK_REGEX)));
 
+# Robust: avoid any(); use array + length > 0
 def stage_has_polaris:
-  any(
-    .. | select(tag == "!!map") | .task? | select(.)
-    ;
-    test(strenv(POLARIS_TASK_REGEX))
-  );
+  (
+    [ .. | select(tag == "!!map") | .task? | select(.) | select(test(strenv(POLARIS_TASK_REGEX))) ]
+    | length
+  ) > 0;
 
 def remove_polaris_steps:
   map(select(((.task? // "") | test(strenv(POLARIS_TASK_REGEX))) | not));
@@ -125,7 +117,6 @@ elif (.steps? // null) != null then
              end)
         )
     end
-
 else
   .
 end
@@ -157,9 +148,9 @@ for f in "${files[@]}"; do
   echo "Debug task values found in file:"
   "$YQ_BIN" e '.. | select(tag=="!!map") | .task? | select(.)' "$f" 2>&1 || true
 
-  # YAML-aware check: does this file contain SynopsysPolaris task anywhere?
+  # Robust detection: collect matches into array and check length
   if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
-      'any(.. | select(tag=="!!map") | .task? | select(.); test(strenv(POLARIS_TASK_REGEX)))' \
+      '([.. | select(tag=="!!map") | .task? | select(.) | select(test(strenv(POLARIS_TASK_REGEX)))] | length) > 0' \
       "$f" >/dev/null 2>&1; then
     echo "Detection result: NO MATCH -> skipping"
     ((++skipped)) || true
