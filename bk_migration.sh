@@ -5,9 +5,10 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-# Which task indicates "Polaris stage" (we replace any stage containing this task)
-POLARIS_TASK_REGEX='^SynopsysPolaris@'
+# Stage name to find (case-insensitive match)
+TARGET_STAGE_NAME="synopsispolaris"
 
+# Where to search for pipeline YAMLs (customize as needed)
 PIPELINE_PATTERNS=(
   -name "azure-pipelines.yml" -o
   -name "azure-pipelines.yaml" -o
@@ -22,8 +23,9 @@ PIPELINE_PATTERNS=(
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }; }
 need_cmd "$YQ_BIN"
 need_cmd find
+need_cmd grep
 
-# Replacement stage content
+# Create the replacement stage YAML (valid Azure DevOps structure)
 STAGE_TMP="$(mktemp)"
 cat > "$STAGE_TMP" <<'YAML'
 - stage: BlackduckCoverityOnPolaris
@@ -51,39 +53,33 @@ cleanup() { rm -f "$STAGE_TMP"; }
 trap cleanup EXIT
 
 # yq program:
-# - stage_has_polaris = stage contains any step with task matching POLARIS_TASK_REGEX
-# - remove all such stages and insert replacement stage at first removed stage index
-YQ_PROGRAM="$(cat <<'YQ'
-def stage_has_polaris:
-  any(
-    # Walk the stage object looking for "task" keys inside steps
-    (.. | select(tag == "!!map") | .task? // empty)
-    ;
-    test(strenv(POLARIS_TASK_REGEX))
-  );
+# - If .stages exists and contains a stage with .stage == synopsispolaris (case-insensitive)
+#   remove it and insert replacement stage in the same position
+read -r -d '' YQ_PROGRAM <<'YQ'
+def stage_name(e):
+  (e.stage // "") | tostring | ascii_downcase;
 
-if (.stages? // null) == null then
-  .
-else
-  (.stages // []) as $st
-  | ($st | to_entries | map(select(.value | stage_has_polaris))) as $matches
-  | if ($matches | length) == 0 then
-      .
-    else
-      ($matches[0].key) as $idx
-      # remove all stages containing SynopsysPolaris tasks
-      | .stages = (
-          $st
-          | to_entries
-          | map(select((.value | stage_has_polaris) | not))
-          | map(.value)
-        )
-      # insert replacement stage at original index
-      | .stages = (.stages[:$idx] + load(strenv(REPL_STAGE_FILE)) + .stages[$idx:])
-    end
-end
+(.stages // null) as $stages
+| if $stages == null then
+    .
+  else
+    ($stages | to_entries | map(select(stage_name(.value) == (strenv(TARGET_STAGE) | ascii_downcase)))) as $matches
+    | if ($matches | length) == 0 then
+        .
+      else
+        ($matches[0].key) as $idx
+        # remove all stages named synopsispolaris (in case there are multiple)
+        | .stages = (
+            $stages
+            | to_entries
+            | map(select(stage_name(.value) != (strenv(TARGET_STAGE) | ascii_downcase)))
+            | map(.value)
+          )
+        # insert replacement stage at original position
+        | .stages = (.stages[:$idx] + load(strenv(REPL_STAGE_FILE)) + .stages[$idx:])
+      end
+  end
 YQ
-)"
 
 echo "Scanning: $ROOT_DIR"
 echo "DRY_RUN=$DRY_RUN"
@@ -92,22 +88,29 @@ echo
 mapfile -t files < <(find "$ROOT_DIR" -type f \( "${PIPELINE_PATTERNS[@]}" \) 2>/dev/null)
 
 if [[ ${#files[@]} -eq 0 ]]; then
-  echo "No pipeline YAML files found."
+  echo "No pipeline YAML files found using configured patterns."
   exit 0
 fi
 
-echo "Found ${#files[@]} candidate pipeline file(s)."
+echo "Found ${#files[@]} candidate file(s)."
 echo
 
 updated=0
 skipped=0
 
 for f in "${files[@]}"; do
-  # YAML-aware check: does this file have any stage containing SynopsysPolaris task?
-  if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
-      '(.stages // []) | any( (.. | select(tag=="!!map") | .task? // empty) | test(strenv(POLARIS_TASK_REGEX)) )' \
-      "$f" >/dev/null 2>&1; then
-    ((++skipped)) || true
+  # Quick filter: only consider files that even mention 'stages:' or 'stage:'
+  if ! grep -qE '(^|\s)stages:|(^|\s)-\s*stage:' "$f"; then
+    ((skipped++)) || true
+    continue
+  fi
+
+  # Check if stage name appears (fast pre-check, case-insensitive)
+  if ! grep -qiE "^\s*-\s*stage:\s*${TARGET_STAGE_NAME}\s*$" "$f"; then
+    # It may be written like: stage: SynopsysPolaris (without dash on same line due to formatting),
+    # so we still allow yq to decide, but we can skip most files quickly.
+    # Comment the next line if you want yq to inspect every candidate file:
+    ((skipped++)) || true
     continue
   fi
 
@@ -115,20 +118,19 @@ for f in "${files[@]}"; do
   echo "Processing: $f"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
-      "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
+    TARGET_STAGE="$TARGET_STAGE_NAME" REPL_STAGE_FILE="$STAGE_TMP" "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
     echo "DRY RUN: would update $f"
-    ((++updated)) || true
+    ((updated++)) || true
     continue
   fi
 
   cp -p "$f" "$f.bak"
 
-  POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
+  TARGET_STAGE="$TARGET_STAGE_NAME" REPL_STAGE_FILE="$STAGE_TMP" \
     "$YQ_BIN" e -i "$YQ_PROGRAM" "$f"
 
-  echo "Updated. Backup saved: $f.bak"
-  ((++updated)) || true
+  echo "Updated. Backup: $f.bak"
+  ((updated++)) || true
 done
 
 echo
