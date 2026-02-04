@@ -5,7 +5,7 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-# Which task indicates "Polaris stage" (we replace any stage containing this task)
+# Which task indicates "Polaris task" (we replace any stage containing this task)
 POLARIS_TASK_REGEX='^SynopsysPolaris@'
 
 PIPELINE_PATTERNS=(
@@ -19,7 +19,9 @@ PIPELINE_PATTERNS=(
   -path "*/.pipelines/*.yaml"
 )
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }; }
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }
+}
 need_cmd "$YQ_BIN"
 need_cmd find
 
@@ -51,36 +53,83 @@ cleanup() { rm -f "$STAGE_TMP"; }
 trap cleanup EXIT
 
 # yq program:
-# - stage_has_polaris = stage contains any step with task matching POLARIS_TASK_REGEX
-# - remove all such stages and insert replacement stage at first removed stage index
+# 1) If .stages exists: remove all stages containing Polaris task and insert replacement stage at first match index
+# 2) Else if .steps exists: convert to stages pipeline:
+#    - split steps into LegacyPre (before first Polaris) + LegacyPost (after first Polaris)
+#    - remove Polaris steps from both
+#    - insert replacement stage between them
 YQ_PROGRAM="$(cat <<'YQ'
+def task_matches:
+  (.task? // "") | test(strenv(POLARIS_TASK_REGEX));
+
 def stage_has_polaris:
   any(
-    # Walk the stage object looking for "task" keys inside steps
     (.. | select(tag == "!!map") | .task? // empty)
     ;
     test(strenv(POLARIS_TASK_REGEX))
   );
 
-if (.stages? // null) == null then
-  .
-else
+def remove_polaris_steps:
+  map(select((.task? // "" | test(strenv(POLARIS_TASK_REGEX))) | not));
+
+def mk_legacy_stage($name; $display; $job; $steps):
+  {
+    "stage": $name,
+    "displayName": $display,
+    "jobs": [
+      {
+        "job": $job,
+        "displayName": $display,
+        "steps": $steps
+      }
+    ]
+  };
+
+if (.stages? // null) != null then
+  # ---- Case 1: stages-based pipeline (your original behavior) ----
   (.stages // []) as $st
   | ($st | to_entries | map(select(.value | stage_has_polaris))) as $matches
   | if ($matches | length) == 0 then
       .
     else
       ($matches[0].key) as $idx
-      # remove all stages containing SynopsysPolaris tasks
       | .stages = (
           $st
           | to_entries
           | map(select((.value | stage_has_polaris) | not))
           | map(.value)
         )
-      # insert replacement stage at original index
       | .stages = (.stages[:$idx] + load(strenv(REPL_STAGE_FILE)) + .stages[$idx:])
     end
+
+elif (.steps? // null) != null then
+  # ---- Case 2: steps-only pipeline -> convert to stages, preserve root keys ----
+  (.steps // []) as $steps
+  | ($steps | to_entries | map(select(.value | task_matches))) as $matches
+  | if ($matches | length) == 0 then
+      .
+    else
+      ($matches[0].key) as $first_idx
+      | ($steps[:$first_idx] | remove_polaris_steps) as $pre
+      | ($steps[($first_idx + 1):] | remove_polaris_steps) as $post
+
+      # Remove .steps from root and add .stages (preserving all other root keys like trigger/pool/variables/resources/etc.)
+      | del(.steps)
+      | .stages = (
+          (if ($pre | length) > 0
+           then [ mk_legacy_stage("LegacyPre";  "Legacy steps (pre)";  "legacy_pre";  $pre) ]
+           else []
+           end)
+          + load(strenv(REPL_STAGE_FILE))
+          + (if ($post | length) > 0
+             then [ mk_legacy_stage("LegacyPost"; "Legacy steps (post)"; "legacy_post"; $post) ]
+             else []
+             end)
+        )
+    end
+
+else
+  .
 end
 YQ
 )"
@@ -103,9 +152,9 @@ updated=0
 skipped=0
 
 for f in "${files[@]}"; do
-  # YAML-aware check: does this file have any stage containing SynopsysPolaris task?
+  # YAML-aware check: does this file contain SynopsysPolaris task anywhere?
   if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
-      '(.stages // []) | any( (.. | select(tag=="!!map") | .task? // empty) | test(strenv(POLARIS_TASK_REGEX)) )' \
+      'any( (.. | select(tag=="!!map") | .task? // empty) | test(strenv(POLARIS_TASK_REGEX)) )' \
       "$f" >/dev/null 2>&1; then
     ((++skipped)) || true
     continue
