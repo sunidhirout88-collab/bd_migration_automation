@@ -46,70 +46,100 @@ cat > "$STAGE_TMP" <<'YAML'
         populateChangeSetFile: true
 YAML
 
-# Write the yq program to a file (more reliable than passing multiline via CLI)
+# yq program file (NO `def` — because yq doesn't support all jq features) [1](https://github.com/mikefarah/yq)
 YQ_PROG_FILE="$(mktemp)"
 cat > "$YQ_PROG_FILE" <<'YQ'
-def task_matches:
-  ((.task? // "") | test(strenv(POLARIS_TASK_REGEX)));
+# NOTE: No `def ...` here (yq is jq-like but not jq, and doesn't support everything jq does). [1](https://github.com/mikefarah/yq)
 
-def stage_has_polaris:
-  (
-    [ .. | select(tag == "!!map") | .task? | select(.) | select(test(strenv(POLARIS_TASK_REGEX))) ]
-    | length
-  ) > 0;
-
-def remove_polaris_steps:
-  map(select(((.task? // "") | test(strenv(POLARIS_TASK_REGEX))) | not));
-
-def mk_legacy_stage($name; $display; $job; $steps):
-  {
-    "stage": $name,
-    "displayName": $display,
-    "jobs": [
-      {
-        "job": $job,
-        "displayName": $display,
-        "steps": $steps
-      }
-    ]
-  };
+# Helper snippets written inline via `as` vars.
 
 if (.stages? // null) != null then
+  # ----- Case 1: stages-based pipeline -----
   (.stages // []) as $st
-  | ($st | to_entries | map(select(.value | stage_has_polaris))) as $matches
+  | (
+      $st
+      | to_entries
+      | map(
+          . as $e
+          | ($e.value) as $stage
+          | $e + {
+              hasPolaris:
+                (
+                  [ $stage
+                    | .. | select(tag=="!!map")
+                    | .task? | select(.)
+                    | select(test(strenv(POLARIS_TASK_REGEX)))
+                  ] | length
+                ) > 0
+            }
+        )
+    ) as $annot
+  | ($annot | map(select(.hasPolaris))) as $matches
   | if ($matches | length) == 0 then
       .
     else
       ($matches[0].key) as $idx
       | .stages = (
-          $st
-          | to_entries
-          | map(select((.value | stage_has_polaris) | not))
+          $annot
+          | map(select(.hasPolaris | not))
           | map(.value)
         )
       | .stages = (.stages[:$idx] + load(strenv(REPL_STAGE_FILE)) + .stages[$idx:])
     end
 
 elif (.steps? // null) != null then
+  # ----- Case 2: steps-only pipeline -> convert to stages, preserve root keys -----
   (.steps // []) as $steps
-  | ($steps | to_entries | map(select(.value | task_matches))) as $matches
+  | (
+      $steps
+      | to_entries
+      | map(select((.value.task? // "") | test(strenv(POLARIS_TASK_REGEX))))
+    ) as $matches
   | if ($matches | length) == 0 then
       .
     else
       ($matches[0].key) as $first_idx
-      | ($steps[:$first_idx] | remove_polaris_steps) as $pre
-      | ($steps[($first_idx + 1):] | remove_polaris_steps) as $post
+      | (
+          $steps[:$first_idx]
+          | map(select(((.task? // "") | test(strenv(POLARIS_TASK_REGEX))) | not))
+        ) as $pre
+      | (
+          $steps[($first_idx + 1):]
+          | map(select(((.task? // "") | test(strenv(POLARIS_TASK_REGEX))) | not))
+        ) as $post
       | del(.steps)
       | .stages = (
-          (if ($pre | length) > 0
-           then [ mk_legacy_stage("LegacyPre";  "Legacy steps (pre)";  "legacy_pre";  $pre) ]
-           else []
-           end)
+          (if ($pre | length) > 0 then
+             [
+               {
+                 "stage": "LegacyPre",
+                 "displayName": "Legacy steps (pre)",
+                 "jobs": [
+                   {
+                     "job": "legacy_pre",
+                     "displayName": "Legacy steps (pre)",
+                     "steps": $pre
+                   }
+                 ]
+               }
+             ]
+           else [] end)
           + load(strenv(REPL_STAGE_FILE))
-          + (if ($post | length) > 0
-             then [ mk_legacy_stage("LegacyPost"; "Legacy steps (post)"; "legacy_post"; $post) ]
-             else []
-             end)
+          + (if ($post | length) > 0 then
+             [
+               {
+                 "stage": "LegacyPost",
+                 "displayName": "Legacy steps (post)",
+                 "jobs": [
+                   {
+                     "job": "legacy_post",
+                     "displayName": "Legacy steps (post)",
+                     "steps": $post
+                   }
+                 ]
+               }
+             ]
+           else [] end)
         )
     end
 
