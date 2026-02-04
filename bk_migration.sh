@@ -86,7 +86,7 @@ def mk_legacy_stage($name; $display; $job; $steps):
   };
 
 if (.stages? // null) != null then
-  # ---- Case 1: stages-based pipeline (your original behavior) ----
+  # ---- Case 1: stages-based pipeline ----
   (.stages // []) as $st
   | ($st | to_entries | map(select(.value | stage_has_polaris))) as $matches
   | if ($matches | length) == 0 then
@@ -112,8 +112,6 @@ elif (.steps? // null) != null then
       ($matches[0].key) as $first_idx
       | ($steps[:$first_idx] | remove_polaris_steps) as $pre
       | ($steps[($first_idx + 1):] | remove_polaris_steps) as $post
-
-      # Remove .steps from root and add .stages (preserving all other root keys like trigger/pool/variables/resources/etc.)
       | del(.steps)
       | .stages = (
           (if ($pre | length) > 0
@@ -136,6 +134,7 @@ YQ
 
 echo "Scanning: $ROOT_DIR"
 echo "DRY_RUN=$DRY_RUN"
+echo "yq version: $("$YQ_BIN" --version 2>&1 || true)"
 echo
 
 mapfile -t files < <(find "$ROOT_DIR" -type f \( "${PIPELINE_PATTERNS[@]}" \) 2>/dev/null)
@@ -145,26 +144,29 @@ if [[ ${#files[@]} -eq 0 ]]; then
   exit 0
 fi
 
-echo "Found ${#files[@]} candidate pipeline file(s)."
+echo "Found ${#files[@]} candidate pipeline file(s):"
+printf ' - %s\n' "${files[@]}"
 echo
 
 updated=0
 skipped=0
 
-echo "yq version: $("$YQ_BIN" --version || true)"
-echo "Debug task values:"
-"$YQ_BIN" e '.. | .task? // empty' "$f" || true
-``
 for f in "${files[@]}"; do
+  echo "----"
+  echo "Checking file: $f"
+  echo "Debug task values found in file:"
+  "$YQ_BIN" e '.. | .task? // empty' "$f" 2>&1 || true
+
   # YAML-aware check: does this file contain SynopsysPolaris task anywhere?
   if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
-  'any(.. | select(tag=="!!map") | .task? // empty; test(strenv(POLARIS_TASK_REGEX)))' \
-  "$f" >/dev/null 2>&1; then
-  ((++skipped)) || true
-  continue
-fi
+      '.. | .task? // empty | test(strenv(POLARIS_TASK_REGEX))' \
+      "$f" >/dev/null 2>&1; then
+    echo "Detection result: NO MATCH -> skipping"
+    ((++skipped)) || true
+    continue
+  fi
 
-  echo "----"
+  echo "Detection result: MATCH -> processing"
   echo "Processing: $f"
 
   if [[ "$DRY_RUN" == "true" ]]; then
