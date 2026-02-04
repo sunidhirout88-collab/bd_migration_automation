@@ -12,6 +12,11 @@ parameters:
   type: string
   default: ''
 
+# Option A (recommended): store token as a secret pipeline variable named GITHUB_TOKEN
+# Option B: reference a variable group that contains GITHUB_TOKEN
+# variables:
+# - group: GitHubSecrets
+
 pool:
   vmImage: ubuntu-latest
 
@@ -28,11 +33,22 @@ steps:
       exit 1
     fi
 
+    if [ -z "${{ parameters.branch }}" ]; then
+      echo "ERROR: branch parameter is empty. Provide a branch when running the pipeline."
+      exit 1
+    fi
+
     rm -rf target
     echo "Cloning: ${{ parameters.repoUrl }}"
     echo "Branch:  ${{ parameters.branch }}"
     git clone --depth 1 --branch "${{ parameters.branch }}" "${{ parameters.repoUrl }}" target
 
     chmod +x bk_migration.sh
-    bash -x bk_migration.sh "$(Build.SourcesDirectory)/target"
-  displayName: "Clone repo and run migration"
+
+    # IMPORTANT: avoid `bash -x` when secrets are involved. Even masked secrets can leak via derived values.
+    # Your script should handle pushing using GITHUB_TOKEN from env.
+    bash bk_migration.sh "$(Build.SourcesDirectory)/target"
+  displayName: "Clone repo and run migration (commit & push)"
+  env:
+    # This picks up the secret variable GITHUB_TOKEN from Azure DevOps
+    GITHUB_TOKEN: $(GITHUB_TOKEN)
