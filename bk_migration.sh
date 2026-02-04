@@ -5,7 +5,6 @@ ROOT_DIR="${1:-.}"
 DRY_RUN="${DRY_RUN:-false}"
 YQ_BIN="${YQ_BIN:-yq}"
 
-# Which task indicates "Polaris task"
 POLARIS_TASK_REGEX='^SynopsysPolaris@'
 
 PIPELINE_PATTERNS=(
@@ -47,14 +46,12 @@ cat > "$STAGE_TMP" <<'YAML'
         populateChangeSetFile: true
 YAML
 
-cleanup() { rm -f "$STAGE_TMP"; }
-trap cleanup EXIT
-
-YQ_PROGRAM="$(cat <<'YQ'
+# Write the yq program to a file (more reliable than passing multiline via CLI)
+YQ_PROG_FILE="$(mktemp)"
+cat > "$YQ_PROG_FILE" <<'YQ'
 def task_matches:
   ((.task? // "") | test(strenv(POLARIS_TASK_REGEX)));
 
-# Robust: avoid any(); use array + length > 0
 def stage_has_polaris:
   (
     [ .. | select(tag == "!!map") | .task? | select(.) | select(test(strenv(POLARIS_TASK_REGEX))) ]
@@ -78,7 +75,6 @@ def mk_legacy_stage($name; $display; $job; $steps):
   };
 
 if (.stages? // null) != null then
-  # ---- Case 1: stages-based pipeline ----
   (.stages // []) as $st
   | ($st | to_entries | map(select(.value | stage_has_polaris))) as $matches
   | if ($matches | length) == 0 then
@@ -95,7 +91,6 @@ if (.stages? // null) != null then
     end
 
 elif (.steps? // null) != null then
-  # ---- Case 2: steps-only pipeline -> convert to stages, preserve root keys ----
   (.steps // []) as $steps
   | ($steps | to_entries | map(select(.value | task_matches))) as $matches
   | if ($matches | length) == 0 then
@@ -117,11 +112,14 @@ elif (.steps? // null) != null then
              end)
         )
     end
+
 else
   .
 end
 YQ
-)"
+
+cleanup() { rm -f "$STAGE_TMP" "$YQ_PROG_FILE"; }
+trap cleanup EXIT
 
 echo "Scanning: $ROOT_DIR"
 echo "DRY_RUN=$DRY_RUN"
@@ -148,7 +146,7 @@ for f in "${files[@]}"; do
   echo "Debug task values found in file:"
   "$YQ_BIN" e '.. | select(tag=="!!map") | .task? | select(.)' "$f" 2>&1 || true
 
-  # Robust detection: collect matches into array and check length
+  # Robust detection: array+length
   if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
       '([.. | select(tag=="!!map") | .task? | select(.) | select(test(strenv(POLARIS_TASK_REGEX)))] | length) > 0' \
       "$f" >/dev/null 2>&1; then
@@ -162,7 +160,7 @@ for f in "${files[@]}"; do
 
   if [[ "$DRY_RUN" == "true" ]]; then
     POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
-      "$YQ_BIN" e "$YQ_PROGRAM" "$f" >/dev/null
+      "$YQ_BIN" e --from-file "$YQ_PROG_FILE" "$f" >/dev/null
     echo "DRY RUN: would update $f"
     ((++updated)) || true
     continue
@@ -171,7 +169,7 @@ for f in "${files[@]}"; do
   cp -p "$f" "$f.bak"
 
   POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
-    "$YQ_BIN" e -i "$YQ_PROGRAM" "$f"
+    "$YQ_BIN" e -i --from-file "$YQ_PROG_FILE" "$f"
 
   echo "Updated. Backup saved: $f.bak"
   ((++updated)) || true
