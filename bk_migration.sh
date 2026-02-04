@@ -60,17 +60,17 @@ trap cleanup EXIT
 #    - insert replacement stage between them
 YQ_PROGRAM="$(cat <<'YQ'
 def task_matches:
-  (.task? // "") | test(strenv(POLARIS_TASK_REGEX));
+  ((.task? // "") | test(strenv(POLARIS_TASK_REGEX)));
 
 def stage_has_polaris:
   any(
-    (.. | select(tag == "!!map") | .task? // empty)
+    .. | select(tag == "!!map") | .task? | select(.)
     ;
     test(strenv(POLARIS_TASK_REGEX))
   );
 
 def remove_polaris_steps:
-  map(select((.task? // "" | test(strenv(POLARIS_TASK_REGEX))) | not));
+  map(select(((.task? // "") | test(strenv(POLARIS_TASK_REGEX))) | not));
 
 def mk_legacy_stage($name; $display; $job; $steps):
   {
@@ -155,11 +155,11 @@ for f in "${files[@]}"; do
   echo "----"
   echo "Checking file: $f"
   echo "Debug task values found in file:"
-  "$YQ_BIN" e '.. | .task? // empty' "$f" 2>&1 || true
+  "$YQ_BIN" e '.. | select(tag=="!!map") | .task? | select(.)' "$f" 2>&1 || true
 
   # YAML-aware check: does this file contain SynopsysPolaris task anywhere?
   if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
-      '.. | .task? // empty | test(strenv(POLARIS_TASK_REGEX))' \
+      'any(.. | select(tag=="!!map") | .task? | select(.); test(strenv(POLARIS_TASK_REGEX)))' \
       "$f" >/dev/null 2>&1; then
     echo "Detection result: NO MATCH -> skipping"
     ((++skipped)) || true
