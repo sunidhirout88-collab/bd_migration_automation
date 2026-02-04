@@ -21,8 +21,9 @@ PIPELINE_PATTERNS=(
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1" >&2; exit 1; }; }
 need_cmd "$YQ_BIN"
 need_cmd find
+need_cmd python3
 
-# Replacement stage content
+# Replacement stage content (YAML list of stages)
 STAGE_TMP="$(mktemp)"
 cat > "$STAGE_TMP" <<'YAML'
 - stage: BlackduckCoverityOnPolaris
@@ -46,109 +47,7 @@ cat > "$STAGE_TMP" <<'YAML'
         populateChangeSetFile: true
 YAML
 
-# yq program file (NO `def` — because yq doesn't support all jq features) [1](https://github.com/mikefarah/yq)
-YQ_PROG_FILE="$(mktemp)"
-cat > "$YQ_PROG_FILE" <<'YQ'
-# NOTE: No `def ...` here (yq is jq-like but not jq, and doesn't support everything jq does). [1](https://github.com/mikefarah/yq)
-
-# Helper snippets written inline via `as` vars.
-
-if (.stages? // null) != null then
-  # ----- Case 1: stages-based pipeline -----
-  (.stages // []) as $st
-  | (
-      $st
-      | to_entries
-      | map(
-          . as $e
-          | ($e.value) as $stage
-          | $e + {
-              hasPolaris:
-                (
-                  [ $stage
-                    | .. | select(tag=="!!map")
-                    | .task? | select(.)
-                    | select(test(strenv(POLARIS_TASK_REGEX)))
-                  ] | length
-                ) > 0
-            }
-        )
-    ) as $annot
-  | ($annot | map(select(.hasPolaris))) as $matches
-  | if ($matches | length) == 0 then
-      .
-    else
-      ($matches[0].key) as $idx
-      | .stages = (
-          $annot
-          | map(select(.hasPolaris | not))
-          | map(.value)
-        )
-      | .stages = (.stages[:$idx] + load(strenv(REPL_STAGE_FILE)) + .stages[$idx:])
-    end
-
-elif (.steps? // null) != null then
-  # ----- Case 2: steps-only pipeline -> convert to stages, preserve root keys -----
-  (.steps // []) as $steps
-  | (
-      $steps
-      | to_entries
-      | map(select((.value.task? // "") | test(strenv(POLARIS_TASK_REGEX))))
-    ) as $matches
-  | if ($matches | length) == 0 then
-      .
-    else
-      ($matches[0].key) as $first_idx
-      | (
-          $steps[:$first_idx]
-          | map(select(((.task? // "") | test(strenv(POLARIS_TASK_REGEX))) | not))
-        ) as $pre
-      | (
-          $steps[($first_idx + 1):]
-          | map(select(((.task? // "") | test(strenv(POLARIS_TASK_REGEX))) | not))
-        ) as $post
-      | del(.steps)
-      | .stages = (
-          (if ($pre | length) > 0 then
-             [
-               {
-                 "stage": "LegacyPre",
-                 "displayName": "Legacy steps (pre)",
-                 "jobs": [
-                   {
-                     "job": "legacy_pre",
-                     "displayName": "Legacy steps (pre)",
-                     "steps": $pre
-                   }
-                 ]
-               }
-             ]
-           else [] end)
-          + load(strenv(REPL_STAGE_FILE))
-          + (if ($post | length) > 0 then
-             [
-               {
-                 "stage": "LegacyPost",
-                 "displayName": "Legacy steps (post)",
-                 "jobs": [
-                   {
-                     "job": "legacy_post",
-                     "displayName": "Legacy steps (post)",
-                     "steps": $post
-                   }
-                 ]
-               }
-             ]
-           else [] end)
-        )
-    end
-
-else
-  .
-end
-YQ
-
-cleanup() { rm -f "$STAGE_TMP" "$YQ_PROG_FILE"; }
+cleanup() { rm -f "$STAGE_TMP"; }
 trap cleanup EXIT
 
 echo "Scanning: $ROOT_DIR"
@@ -173,10 +72,11 @@ skipped=0
 for f in "${files[@]}"; do
   echo "----"
   echo "Checking file: $f"
+
   echo "Debug task values found in file:"
   "$YQ_BIN" e '.. | select(tag=="!!map") | .task? | select(.)' "$f" 2>&1 || true
 
-  # Robust detection: array+length
+  # Detect Polaris task anywhere (works with yq v4)
   if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
       '([.. | select(tag=="!!map") | .task? | select(.) | select(test(strenv(POLARIS_TASK_REGEX)))] | length) > 0' \
       "$f" >/dev/null 2>&1; then
@@ -186,11 +86,8 @@ for f in "${files[@]}"; do
   fi
 
   echo "Detection result: MATCH -> processing"
-  echo "Processing: $f"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
-      "$YQ_BIN" e --from-file "$YQ_PROG_FILE" "$f" >/dev/null
     echo "DRY RUN: would update $f"
     ((++updated)) || true
     continue
@@ -198,8 +95,100 @@ for f in "${files[@]}"; do
 
   cp -p "$f" "$f.bak"
 
-  POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" \
-    "$YQ_BIN" e -i --from-file "$YQ_PROG_FILE" "$f"
+  # Do the actual transformation in python (because yq doesn't support if/else conditionals)
+  POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" REPL_STAGE_FILE="$STAGE_TMP" python3 - "$f" <<'PY'
+import os, re, sys
+
+try:
+    import yaml
+except Exception as e:
+    print("ERROR: Python module 'yaml' (PyYAML) is required but not available.", file=sys.stderr)
+    print("Install it on the agent: pip install pyyaml", file=sys.stderr)
+    raise
+
+path = sys.argv[1]
+regex = re.compile(os.environ["POLARIS_TASK_REGEX"])
+repl_stage_file = os.environ["REPL_STAGE_FILE"]
+
+def contains_polaris(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "task" and isinstance(v, str) and regex.search(v):
+                return True
+            if contains_polaris(v):
+                return True
+    elif isinstance(obj, list):
+        return any(contains_polaris(i) for i in obj)
+    return False
+
+def remove_polaris_steps(steps):
+    out = []
+    for s in steps or []:
+        if isinstance(s, dict) and isinstance(s.get("task"), str) and regex.search(s["task"]):
+            continue
+        out.append(s)
+    return out
+
+def mk_legacy_stage(name, display, job, steps):
+    return {
+        "stage": name,
+        "displayName": display,
+        "jobs": [{
+            "job": job,
+            "displayName": display,
+            "steps": steps
+        }]
+    }
+
+with open(path, "r", encoding="utf-8") as f:
+    doc = yaml.safe_load(f) or {}
+
+with open(repl_stage_file, "r", encoding="utf-8") as f:
+    repl_stages = yaml.safe_load(f) or []
+    if not isinstance(repl_stages, list):
+        raise ValueError("Replacement stage file must be a YAML list of stages")
+
+# CASE 1: stages-based pipeline
+if isinstance(doc.get("stages"), list):
+    stages = doc["stages"]
+    matches = [i for i, st in enumerate(stages) if contains_polaris(st)]
+    if not matches:
+        # nothing to do
+        sys.exit(0)
+    insert_at = matches[0]
+    kept = [st for st in stages if not contains_polaris(st)]
+    doc["stages"] = kept[:insert_at] + repl_stages + kept[insert_at:]
+
+# CASE 2: steps-only pipeline
+elif isinstance(doc.get("steps"), list):
+    steps = doc["steps"]
+    first_idx = None
+    for i, s in enumerate(steps):
+        if isinstance(s, dict) and isinstance(s.get("task"), str) and regex.search(s["task"]):
+            first_idx = i
+            break
+    if first_idx is None:
+        sys.exit(0)
+
+    pre = remove_polaris_steps(steps[:first_idx])
+    post = remove_polaris_steps(steps[first_idx+1:])
+
+    doc.pop("steps", None)
+    new_stages = []
+    if pre:
+        new_stages.append(mk_legacy_stage("LegacyPre", "Legacy steps (pre)", "legacy_pre", pre))
+    new_stages.extend(repl_stages)
+    if post:
+        new_stages.append(mk_legacy_stage("LegacyPost", "Legacy steps (post)", "legacy_post", post))
+    doc["stages"] = new_stages
+
+else:
+    # neither stages nor steps at root
+    sys.exit(0)
+
+with open(path, "w", encoding="utf-8") as f:
+    yaml.safe_dump(doc, f, sort_keys=False)
+PY
 
   echo "Updated. Backup saved: $f.bak"
   ((++updated)) || true
