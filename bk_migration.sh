@@ -151,14 +151,18 @@ echo
 updated=0
 skipped=0
 
+echo "yq version: $("$YQ_BIN" --version || true)"
+echo "Debug task values:"
+"$YQ_BIN" e '.. | .task? // empty' "$f" || true
+``
 for f in "${files[@]}"; do
   # YAML-aware check: does this file contain SynopsysPolaris task anywhere?
   if ! POLARIS_TASK_REGEX="$POLARIS_TASK_REGEX" "$YQ_BIN" e -e \
-      'any( (.. | select(tag=="!!map") | .task? // empty) | test(strenv(POLARIS_TASK_REGEX)) )' \
-      "$f" >/dev/null 2>&1; then
-    ((++skipped)) || true
-    continue
-  fi
+  'any(.. | select(tag=="!!map") | .task? // empty; test(strenv(POLARIS_TASK_REGEX)))' \
+  "$f" >/dev/null 2>&1; then
+  ((++skipped)) || true
+  continue
+fi
 
   echo "----"
   echo "Processing: $f"
