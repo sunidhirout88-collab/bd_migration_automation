@@ -1,22 +1,20 @@
-set -euo pipefail
-
-REPO_URL="https://github.com/sunidhirout88-collab/blackduck_migration_test.git"
-BRANCH="blackduck_cli"
-
-rm -rf target
-git clone --branch "${BRANCH}" "${REPO_URL}" target
-cd target
-
-# Find the pipeline YAML
-PIPELINE_FILE="$(find . -maxdepth 4 -type f \( -name "azure-pipelines.yml" -o -name "azure-pipelines.yaml" \) | head -n 1)"
-if [[ -z "${PIPELINE_FILE}" ]]; then
-  echo "ERROR: No azure-pipelines.yml found."
-  find . -maxdepth 6 -type f -name "*.yml" -o -name "*.yaml" | head -n 200
-  exit 1
+# Commit & push only if changed
+if git diff --quiet; then
+  echo "No changes detected. Nothing to commit."
+  exit 0
 fi
-PIPELINE_FILE="${PIPELINE_FILE#./}"
-echo "Using pipeline: ${PIPELINE_FILE}"
 
-# ...create SCRIPT_PATH + heredoc python here...
+git add "${PIPELINE_FILE}"
+git commit -m "Migrate pipeline: Polaris -> Black Duck SCA server scan"
 
-python3 "${SCRIPT_PATH}" "${PIPELINE_FILE}" --in-place
+# --- Push using GitHub PAT securely ---
+: "${GITHUB_PAT:?GITHUB_PAT is not set}"
+
+# Prevent accidental secret printing
+set +x
+AUTH_HEADER=$(printf "x-access-token:%s" "$GITHUB_PAT" | base64 -w0)
+set -x
+
+git -c http.extraheader="AUTHORIZATION: basic ${AUTH_HEADER}" push origin "${BRANCH}"
+
+echo "✅ Migration complete and pushed."
