@@ -1,74 +1,22 @@
-SCRIPT_PATH="$(mktemp)"
+set -euo pipefail
 
-cat > "${SCRIPT_PATH}" <<'PY'
-import argparse
-import copy
-from typing import Any, Dict
-import yaml
+REPO_URL="https://github.com/sunidhirout88-collab/blackduck_migration_test.git"
+BRANCH="blackduck_cli"
 
-SYNOPSYS_TASK_NAMES = {"SynopsysPolaris@1", "SynopsysPolaris@0", "SynopsysPolaris"}
-BLACKDUCK_TASK = "BlackDuckSecurityScan@2"
+rm -rf target
+git clone --branch "${BRANCH}" "${REPO_URL}" target
+cd target
 
-DEFAULT_BLACKDUCKSCA_INPUTS = {
-    "BLACKDUCKSCA_URL": "$(BLACKDUCK_URL)",
-    "BLACKDUCKSCA_TOKEN": "$(BLACKDUCK_TOKEN)",
-}
-DEFAULT_ENV = {"DETECT_PROJECT_NAME": "$(Build.Repository.Name)"}
+# Find the pipeline YAML
+PIPELINE_FILE="$(find . -maxdepth 4 -type f \( -name "azure-pipelines.yml" -o -name "azure-pipelines.yaml" \) | head -n 1)"
+if [[ -z "${PIPELINE_FILE}" ]]; then
+  echo "ERROR: No azure-pipelines.yml found."
+  find . -maxdepth 6 -type f -name "*.yml" -o -name "*.yaml" | head -n 200
+  exit 1
+fi
+PIPELINE_FILE="${PIPELINE_FILE#./}"
+echo "Using pipeline: ${PIPELINE_FILE}"
 
-def is_synopsys_polaris_step(step: Any) -> bool:
-    return isinstance(step, dict) and step.get("task") in SYNOPSYS_TASK_NAMES
+# ...create SCRIPT_PATH + heredoc python here...
 
-def convert_step(step: Dict[str, Any]) -> Dict[str, Any]:
-    new_step: Dict[str, Any] = {}
-    for k in ("displayName", "condition", "continueOnError", "enabled", "timeoutInMinutes"):
-        if k in step:
-            new_step[k] = step[k]
-    if "displayName" not in new_step:
-        new_step["displayName"] = "Black Duck SCA Scan"
-    new_step["task"] = BLACKDUCK_TASK
-    new_step["inputs"] = copy.deepcopy(DEFAULT_BLACKDUCKSCA_INPUTS)
-    new_step["env"] = copy.deepcopy(DEFAULT_ENV)
-    return new_step
-
-def walk_and_convert(node: Any) -> Any:
-    if isinstance(node, dict):
-        out = {}
-        for k, v in node.items():
-            if k == "steps" and isinstance(v, list):
-                new_steps = []
-                for step in v:
-                    if is_synopsys_polaris_step(step):
-                        new_steps.append(convert_step(step))
-                    else:
-                        new_steps.append(walk_and_convert(step))
-                out[k] = new_steps
-            else:
-                out[k] = walk_and_convert(v)
-        return out
-    if isinstance(node, list):
-        return [walk_and_convert(x) for x in node]
-    return node
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("file")
-    ap.add_argument("--in-place", action="store_true")
-    args = ap.parse_args()
-
-    with open(args.file, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-
-    converted = walk_and_convert(data)
-    out_path = args.file if args.in_place else args.file + ".blackducksca.yml"
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(converted, f, sort_keys=False)
-
-    print(f"Converted pipeline saved to: {out_path}")
-
-if __name__ == "__main__":
-    main()
-PY
-
-python3 "${SCRIPT_PATH}" azure-pipelines.yml --in-place
-rm -f "${SCRIPT_PATH}"
+python3 "${SCRIPT_PATH}" "${PIPELINE_FILE}" --in-place
