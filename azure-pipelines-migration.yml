@@ -38,8 +38,8 @@ steps:
     echo "Branch:  ${{ parameters.branch }}"
     git clone --depth 1 --branch "${{ parameters.branch }}" "${{ parameters.repoUrl }}" target
 
-    chmod +x bk_migration.sh
-    bash bk_migration.sh "$(Build.SourcesDirectory)/target"
+    chmod +x migration.sh
+    bash migration.sh "$(Build.SourcesDirectory)/target"
   displayName: "Clone repo and run migration (commit & push)"
   env:
     # Secret PAT for GitHub push (Azure DevOps recommends secret vars over CLI args) [1](https://www.geeksforgeeks.org/python/how-to-define-and-call-a-function-in-python/)
