@@ -13,32 +13,29 @@ rm -rf "${WORKDIR}"
 git clone --branch "${BRANCH}" "${REPO_URL}" "${WORKDIR}"
 cd "${WORKDIR}"
 
-# Ensure Python is available (hosted ubuntu agents typically have python3)
-python3 --version
+# ✅ Configure git identity locally so commit works on CI agent
+git config user.name  "azure-pipelines-bot"
+git config user.email "azure-pipelines-bot@users.noreply.github.com"
 
-# Install dependency for YAML parsing
+python3 --version
 python3 -m pip install --user --upgrade pip
 python3 -m pip install --user pyyaml
 
-# Write the converter script to a file (IMPORTANT)
-cat > convert_polaris_to_blackduck_sca.py <<'PY'
+# Create converter in TEMP (so it won't show as untracked in repo)
+SCRIPT_PATH="$(mktemp)"
+cat > "$SCRIPT_PATH" <<'PY'
 import argparse
 import copy
-import sys
 from typing import Any, Dict
-
 import yaml
 
 SYNOPSYS_TASK_NAMES = {"SynopsysPolaris@1", "SynopsysPolaris@0", "SynopsysPolaris"}
 BLACKDUCK_TASK = "BlackDuckSecurityScan@2"
 
-# From Black Duck docs: ADO example uses BlackDuckSecurityScan@2 with BLACKDUCKSCA_URL and BLACKDUCKSCA_TOKEN inputs. [1](https://github.com/synopsys-sig/polaris-ado/blob/master/docs/docs.md)
 DEFAULT_BLACKDUCKSCA_INPUTS = {
     "BLACKDUCKSCA_URL": "$(BLACKDUCK_URL)",
     "BLACKDUCKSCA_TOKEN": "$(BLACKDUCK_TOKEN)",
 }
-
-# Docs: Detect-specific options can be passed through Detect environment variables, e.g., project name. [1](https://github.com/synopsys-sig/polaris-ado/blob/master/docs/docs.md)[2](https://sig-synopsys.my.site.com/community/s/article/Polaris-Azure-DevOps-Pipeline-Integration)
 DEFAULT_ENV = {
     "DETECT_PROJECT_NAME": "$(Build.Repository.Name)",
 }
@@ -81,28 +78,22 @@ def walk_and_convert(node: Any) -> Any:
             else:
                 out[k] = walk_and_convert(v)
         return out
-
     if isinstance(node, list):
         return [walk_and_convert(x) for x in node]
-
     return node
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("file", help="Path to azure-pipelines.yml")
-    ap.add_argument("--in-place", action="store_true", help="Overwrite input file")
-    ap.add_argument("--out", help="Output file path")
+    ap.add_argument("file")
+    ap.add_argument("--in-place", action="store_true")
+    ap.add_argument("--out")
     args = ap.parse_args()
 
     with open(args.file, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     converted = walk_and_convert(data)
-
-    if args.in_place:
-        out_path = args.file
-    else:
-        out_path = args.out or (args.file.replace(".yml", ".blackducksca.yml").replace(".yaml", ".blackducksca.yaml"))
+    out_path = args.file if args.in_place else (args.out or args.file + ".blackducksca.yml")
 
     with open(out_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(converted, f, sort_keys=False)
@@ -113,22 +104,13 @@ if __name__ == "__main__":
     main()
 PY
 
-# Run conversion
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
   echo "ERROR: ${PIPELINE_FILE} not found in repo root."
   exit 1
 fi
 
-python3 convert_polaris_to_blackduck_sca.py "${PIPELINE_FILE}" --in-place
+python3 "$SCRIPT_PATH" "${PIPELINE_FILE}" --in-place
+rm -f "$SCRIPT_PATH"
 
-# Commit & push if anything changed
+# Commit & push only if something changed
 if git diff --quiet; then
-  echo "No changes detected. Nothing to commit."
-  exit 0
-fi
-
-git status
-git add "${PIPELINE_FILE}"
-git commit -m "Migrate from SynopsysPolaris task to Black Duck SCA (BlackDuckSecurityScan@2)"
-git push origin "${BRANCH}"
-echo "✅ Migration complete and pushed."
