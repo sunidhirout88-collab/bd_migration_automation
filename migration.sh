@@ -94,7 +94,7 @@ yq -i '
 COV_IDX="$(yq e '
   (.stages // [])
   | to_entries
-  | map(select((.value.stage // .value.name // "") | ascii_downcase == "coverity"))
+  | map(select((.value.stage // .value.name // "") | test("(?i)^coverity$")))
   | .[0].key
 ' "${PIPELINE_FILE}")"
 
