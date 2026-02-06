@@ -1,128 +1,181 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./replace_coverity_stage.sh azure-pipelines.yml
 PIPELINE_FILE="azure-pipelines.yml"
 
 ls -la target
 find target -maxdepth 2 -name "azure-pipelines.y*ml" -print
-
-# if [[ -z "${PIPELINE_FILE}" || ! -f "${PIPELINE_FILE}" ]]; then
-#   echo "Usage: $0 <pipeline-yaml-file>"
-#   echo "Error: file not found: ${PIPELINE_FILE}"
-#   exit 1
-# fi
-
-# ---- Check yq availability (Mike Farah yq v4) ----
 yq --version || yq -V
 cd target/
 if ! command -v yq >/dev/null 2>&1; then
-  echo "ERROR: 'yq' (Mike Farah, v4+) is required but not installed."
-  echo "Install examples:"
-  echo "  macOS:  brew install yq"
-  echo "  Linux:  https://github.com/mikefarah/yq/#install"
+  echo "ERROR: yq (Mike Farah, v4+) is required."
+  echo "Install:"
+  echo "  macOS: brew install yq"
+  echo "  Linux: https://github.com/mikefarah/yq/#install"
   exit 1
 fi
 
-# ---- Create the replacement stage YAML in a temp file ----
-TMP_STAGE="$(mktemp)"
-cat > "${TMP_STAGE}" <<'YAML'
-stage: blackduckcoverity
-displayName: "Black Duck Scan (Synopsys Detect)"
-variables:
-  BLACKDUCK_URL: 'https://blackduck.mycompany.com'
-  BD_PROJECT: 'my-app'
-  BD_VERSION: '$(Build.SourceBranchName)'
-  DETECT_VERSION: 'latest'   # or pin e.g. 9.10.0
-
-jobs:
-  - job: blackduck_scan
-    displayName: "Black Duck Scan"
-    steps:
-      - checkout: self
-        fetchDepth: 0
-
-      # (Optional) Use Java if Detect needs it (depending on Detect packaging/version)
-      - task: JavaToolInstaller@0
-        displayName: "Use Java 11"
-        inputs:
-          versionSpec: '11'
-          jdkArchitectureOption: 'x64'
-          jdkSourceOption: 'PreInstalled'
-
-      - bash: |
-          set -euo pipefail
-
-          echo "Downloading Synopsys Detect..."
-          curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh
-          chmod +x detect.sh
-
-          echo "Running Black Duck scan via Synopsys Detect..."
-          ./detect.sh \
-            --blackduck.url="$(BLACKDUCK_URL)" \
-            --blackduck.api.token="$(BLACKDUCK_API_TOKEN)" \
-            --detect.project.name="$(BD_PROJECT)" \
-            --detect.project.version.name="$(BD_VERSION)" \
-            --detect.source.path="$(Build.SourcesDirectory)" \
-            --detect.tools=DETECTOR,SIGNATURE_SCAN \
-            --detect.detector.search.depth=6 \
-            --detect.wait.for.results=true \
-            --detect.notices.report=true \
-            --detect.risk.report.pdf=true \
-            --logging.level.com.synopsys.integration=INFO \
-            --detect.cleanup=true
-        displayName: "Black Duck Scan (Synopsys Detect)"
-        env:
-          # Store BLACKDUCK_API_TOKEN as a secret variable in pipeline/library
-          BLACKDUCK_API_TOKEN: $(BLACKDUCK_API_TOKEN)
-
-      # Publish generated reports (paths may vary slightly by Detect version/config)
-      - task: PublishBuildArtifacts@1
-        displayName: "Publish Black Duck Reports"
-        inputs:
-          PathtoPublish: "$(Build.SourcesDirectory)/blackduck"
-          ArtifactName: "blackduck-reports"
-        condition: succeededOrFailed()
+# --- Black Duck variables (map) ---
+BD_VARS="$(mktemp)"
+cat > "${BD_VARS}" <<'YAML'
+BLACKDUCK_URL: 'https://blackduck.mycompany.com'
+BD_PROJECT: 'my-app'
+BD_VERSION: '$(Build.SourceBranchName)'
+DETECT_VERSION: 'latest'   # or pin e.g. 9.10.0
 YAML
 
-# ---- Ensure .stages exists ----
-yq -i '
-  .stages = (.stages // [])
-' "${PIPELINE_FILE}"
+# --- Black Duck steps (sequence) - EXACTLY as you provided ---
+BD_STEPS="$(mktemp)"
+cat > "${BD_STEPS}" <<'YAML'
+- checkout: self
+  fetchDepth: 0
 
-# ---- Find index of stage named "coverity" (case-insensitive), matching either .stage or .name ----
-COV_IDX="$(yq e '
-  (.stages // [])
-  | to_entries
-  | map(select((.value.stage // .value.name // "") | test("(?i)^coverity$")))
-  | .[0].key
-' "${PIPELINE_FILE}")"
+# (Optional) Use Java if Detect needs it (depending on Detect packaging/version)
+- task: JavaToolInstaller@0
+  displayName: "Use Java 11"
+  inputs:
+    versionSpec: '11'
+    jdkArchitectureOption: 'x64'
+    jdkSourceOption: 'PreInstalled'
 
-# yq prints "null" if not found
-if [[ "${COV_IDX}" == "null" || -z "${COV_IDX}" ]]; then
-  echo "No 'coverity' stage found. Appending 'blackduckcoverity' stage."
-  # Append the new stage
-  yq -i '
-    .stages += [load(strenv(TMP_STAGE))]
-  ' "${PIPELINE_FILE}" TMP_STAGE="${TMP_STAGE}"
-else
-  echo "Found 'coverity' stage at index ${COV_IDX}. Replacing with 'blackduckcoverity'."
+- bash: |
+    set -euo pipefail
 
-  # Delete coverity at that index
-  yq -i "del(.stages[${COV_IDX}])" "${PIPELINE_FILE}"
+    echo "Downloading Synopsys Detect..."
+    curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh
+    chmod +x detect.sh
 
-  # Insert new stage at same index
-  # Use env var for index; yq slicing requires numeric index
-  export COV_IDX
-  export TMP_STAGE
-  yq -i '
-    .stages |= (
-      .[:env(COV_IDX)] +
-      [load(strenv(TMP_STAGE))] +
-      .[env(COV_IDX):]
-    )
-  ' "${PIPELINE_FILE}"
-fi
+    echo "Running Black Duck scan via Synopsys Detect..."
+    ./detect.sh \
+      --blackduck.url="$(BLACKDUCK_URL)" \
+      --blackduck.api.token="$(BLACKDUCK_API_TOKEN)" \
+      --detect.project.name="$(BD_PROJECT)" \
+      --detect.project.version.name="$(BD_VERSION)" \
+      --detect.source.path="$(Build.SourcesDirectory)" \
+      --detect.tools=DETECTOR,SIGNATURE_SCAN \
+      --detect.detector.search.depth=6 \
+      --detect.wait.for.results=true \
+      --detect.notices.report=true \
+      --detect.risk.report.pdf=true \
+      --logging.level.com.synopsys.integration=INFO \
+      --detect.cleanup=true
+  displayName: "Black Duck Scan (Synopsys Detect)"
+  env:
+    # Store BLACKDUCK_API_TOKEN as a secret variable in pipeline/library
+    BLACKDUCK_API_TOKEN: $(BLACKDUCK_API_TOKEN)
 
-rm -f "${TMP_STAGE}"
-echo "Done. Updated: ${PIPELINE_FILE}"
+# Publish generated reports (paths may vary slightly by Detect version/config)
+- task: PublishBuildArtifacts@1
+  displayName: "Publish Black Duck Reports"
+  inputs:
+    PathtoPublish: "$(Build.SourcesDirectory)/blackduck"
+    ArtifactName: "blackduck-reports"
+  condition: succeededOrFailed()
+YAML
+
+export BD_VARS BD_STEPS
+
+# --- Coverity step detection (tailored to your snippet) ---
+# It matches:
+# - cov-build/cov-analyze/cov-format-errors/cov-commit-defects (and other cov-* tools)
+# - the word "coverity" in bash/script text
+# - displayName containing "coverity"
+COVERITY_EXPR='
+def is_coverity_step:
+  (
+    ((.bash // .script // "") | ascii_downcase)
+    | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b")
+  )
+  or ((.displayName // "") | ascii_downcase | test("\\bcoverity\\b"));
+'
+
+# --- Merge vars into current node (job-level variables if we are in a job) ---
+MERGE_VARS_FN='
+def merge_vars(new):
+  if .variables == null then
+    .variables = new
+  elif (.variables | type) == "!!map" then
+    .variables = (.variables * new)
+  elif (.variables | type) == "!!seq" then
+    .variables += (new | to_entries | map({"name": .key, "value": .value}))
+  else
+    .
+  end;
+'
+
+# --- Delete coverity vars (COVERITY_*) at the same scope ---
+DELETE_COV_VARS_FN='
+def delete_coverity_vars:
+  if .variables == null then
+    .
+  elif (.variables | type) == "!!map" then
+    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
+  elif (.variables | type) == "!!seq" then
+    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
+  else
+    .
+  end;
+'
+
+# --- Main transformation ---
+# For any YAML map that has steps: [ ... ],
+# if it contains any coverity steps:
+#  1) remove coverity steps
+#  2) remove COVERITY_* variables at same level
+#  3) merge BLACKDUCK_* vars at same level
+#  4) insert Black Duck steps at the position of the first removed coverity step (keeps ordering)
+yq -i "
+${COVERITY_EXPR}
+${MERGE_VARS_FN}
+${DELETE_COV_VARS_FN}
+
+def already_has_blackduck:
+  (
+    (.steps // [])
+    | map(
+        ((.displayName // \"\") | ascii_downcase)
+        + \" \" +
+        ((.bash // .script // \"\") | ascii_downcase)
+      )
+    | any(test(\"black duck|synopsys detect|detect\\.sh|blackduck\\.url\"))
+  );
+
+def inject_blackduck_preserving_position:
+  # Determine the index of the first coverity step
+  (.steps | to_entries | map(select(.value | is_coverity_step)) | .[0].key) as \$firstIdx
+  | (if \$firstIdx == null then . else
+      # Split existing steps into prefix, removed coverity, and suffix (non-coverity)
+      (.steps[0:\$firstIdx]) as \$prefix
+      | (.steps | map(select(is_coverity_step | not))) as \$noncov_all
+      # Now we need the suffix that starts at firstIdx but without coverity steps.
+      # Construct suffix by taking original steps from firstIdx onward, then dropping coverity steps.
+      | (.steps[\$firstIdx:] | map(select(is_coverity_step | not))) as \$suffix
+      # Replace steps: prefix + blackduck + suffix
+      | .steps = (\$prefix + load(strenv(BD_STEPS)) + \$suffix)
+    end);
+
+def transform_node:
+  if (type == \"!!map\" and has(\"steps\") and (.steps | type == \"!!seq\")) then
+    if (.steps | any(is_coverity_step)) then
+      # Remove coverity steps and variables, add blackduck vars, inject steps at same position
+      delete_coverity_vars
+      | merge_vars(load(strenv(BD_VARS)))
+      | (if already_has_blackduck then
+           # If blackduck already exists, just remove coverity steps and keep order
+           .steps |= map(select(is_coverity_step | not))
+         else
+           inject_blackduck_preserving_position
+         end)
+    else
+      .
+    end
+  else
+    .
+  end;
+
+walk(transform_node)
+" "${FILE}"
+
+rm -f "${BD_VARS}" "${BD_STEPS}"
+
+echo "Done. Coverity steps removed, COVERITY_* variables removed, and Black Duck steps injected in: ${FILE}"
