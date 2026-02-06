@@ -124,44 +124,63 @@ def delete_coverity_vars:
 #  2) remove COVERITY_* variables at same level
 #  3) merge BLACKDUCK_* vars at same level
 #  4) insert Black Duck steps at the position of the first removed coverity step (keeps ordering)
-yq -i "
-${COVERITY_EXPR}
-${MERGE_VARS_FN}
-${DELETE_COV_VARS_FN}
+YQ_PROG="$(mktemp)"
+
+cat > "${YQ_PROG}" <<'YQ'
+def is_coverity_step:
+  (
+    ((.bash // .script // "") | ascii_downcase)
+    | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b")
+  )
+  or ((.displayName // "") | ascii_downcase | test("\\bcoverity\\b"));
+
+def merge_vars(new):
+  if .variables == null then
+    .variables = new
+  elif (.variables | type) == "!!map" then
+    .variables = (.variables * new)
+  elif (.variables | type) == "!!seq" then
+    .variables += (new | to_entries | map({"name": .key, "value": .value}))
+  else
+    .
+  end;
+
+def delete_coverity_vars:
+  if .variables == null then
+    .
+  elif (.variables | type) == "!!map" then
+    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
+  elif (.variables | type) == "!!seq" then
+    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
+  else
+    .
+  end;
 
 def already_has_blackduck:
   (
     (.steps // [])
     | map(
-        ((.displayName // \"\") | ascii_downcase)
-        + \" \" +
-        ((.bash // .script // \"\") | ascii_downcase)
+        ((.displayName // "") | ascii_downcase)
+        + " " +
+        ((.bash // .script // "") | ascii_downcase)
       )
-    | any(test(\"black duck|synopsys detect|detect\\.sh|blackduck\\.url\"))
+    | any(test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))
   );
 
 def inject_blackduck_preserving_position:
-  # Determine the index of the first coverity step
-  (.steps | to_entries | map(select(.value | is_coverity_step)) | .[0].key) as \$firstIdx
-  | (if \$firstIdx == null then . else
-      # Split existing steps into prefix, removed coverity, and suffix (non-coverity)
-      (.steps[0:\$firstIdx]) as \$prefix
-      | (.steps | map(select(is_coverity_step | not))) as \$noncov_all
-      # Now we need the suffix that starts at firstIdx but without coverity steps.
-      # Construct suffix by taking original steps from firstIdx onward, then dropping coverity steps.
-      | (.steps[\$firstIdx:] | map(select(is_coverity_step | not))) as \$suffix
-      # Replace steps: prefix + blackduck + suffix
-      | .steps = (\$prefix + load(strenv(BD_STEPS)) + \$suffix)
+  (.steps | to_entries | map(select(.value | is_coverity_step)) | .[0].key) as $firstIdx
+  | (if $firstIdx == null then . else
+      (.steps[0:$firstIdx]) as $prefix
+      | (.steps[$firstIdx:] | map(select(is_coverity_step | not))) as $suffix
+      | .steps = ($prefix + load(strenv(BD_STEPS)) + $suffix)
     end);
 
 def transform_node:
-  if (type == \"!!map\" and has(\"steps\") and (.steps | type == \"!!seq\")) then
+  if (type == "!!map" and has("steps") and (.steps | type == "!!seq")) then
     if (.steps | any(is_coverity_step)) then
-      # Remove coverity steps and variables, add blackduck vars, inject steps at same position
       delete_coverity_vars
       | merge_vars(load(strenv(BD_VARS)))
       | (if already_has_blackduck then
-           # If blackduck already exists, just remove coverity steps and keep order
            .steps |= map(select(is_coverity_step | not))
          else
            inject_blackduck_preserving_position
@@ -174,8 +193,12 @@ def transform_node:
   end;
 
 walk(transform_node)
-" "${FILE}"
+YQ
 
+# Use yq v4 syntax explicitly
+yq eval -i -f "${YQ_PROG}" "${FILE}"
+
+rm -f "${YQ_PROG}"
 rm -f "${BD_VARS}" "${BD_STEPS}"
 
 echo "Done. Coverity steps removed, COVERITY_* variables removed, and Black Duck steps injected in: ${FILE}"
