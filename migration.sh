@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage: ./replace_coverity_stage.sh azure-pipelines.yml
-PIPELINE_FILE="azure-pipelines.yml"
+PIPELINE_FILE="target/azure-pipelines.yml"
 
 ls -la target
 find target -maxdepth 2 -name "azure-pipelines.y*ml" -print
