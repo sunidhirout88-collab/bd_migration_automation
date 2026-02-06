@@ -4,6 +4,9 @@ set -euo pipefail
 # Usage: ./replace_coverity_stage.sh azure-pipelines.yml
 PIPELINE_FILE="azure-pipelines.yml"
 
+ls -la target
+find target -maxdepth 2 -name "azure-pipelines.y*ml" -print
+
 if [[ -z "${PIPELINE_FILE}" || ! -f "${PIPELINE_FILE}" ]]; then
   echo "Usage: $0 <pipeline-yaml-file>"
   echo "Error: file not found: ${PIPELINE_FILE}"
