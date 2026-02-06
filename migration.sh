@@ -7,11 +7,11 @@ PIPELINE_FILE="azure-pipelines.yml"
 ls -la target
 find target -maxdepth 2 -name "azure-pipelines.y*ml" -print
 
-if [[ -z "${PIPELINE_FILE}" || ! -f "${PIPELINE_FILE}" ]]; then
-  echo "Usage: $0 <pipeline-yaml-file>"
-  echo "Error: file not found: ${PIPELINE_FILE}"
-  exit 1
-fi
+# if [[ -z "${PIPELINE_FILE}" || ! -f "${PIPELINE_FILE}" ]]; then
+#   echo "Usage: $0 <pipeline-yaml-file>"
+#   echo "Error: file not found: ${PIPELINE_FILE}"
+#   exit 1
+# fi
 
 # ---- Check yq availability (Mike Farah yq v4) ----
 if ! command -v yq >/dev/null 2>&1; then
