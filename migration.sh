@@ -202,3 +202,4 @@ rm -f "${YQ_PROG}"
 rm -f "${BD_VARS}" "${BD_STEPS}"
 
 echo "Done. Coverity steps removed, COVERITY_* variables removed, and Black Duck steps injected in: ${FILE}"
+cat azure-pipelines.yml
