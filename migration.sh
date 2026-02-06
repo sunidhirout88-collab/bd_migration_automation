@@ -1,29 +1,68 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./replace_coverity_stage.sh azure-pipelines.yml
-PIPELINE_FILE="target/azure-pipelines.yml"
+# ------------------------------------------------------------------------------
+# migration.sh
+# Replaces a stage named "coverity" (case-insensitive) with "blackduckcoverity"
+# in an Azure DevOps pipeline YAML.
+#
+# Usage:
+#   ./migration.sh [path-to-pipeline-yaml]
+#
+# Examples:
+#   ./migration.sh target/azure-pipelines.yml
+#   ./migration.sh                     # auto-detects in ./target or current dir
+# ------------------------------------------------------------------------------
 
-ls -la target
-find target -maxdepth 2 -name "azure-pipelines.y*ml" -print
+log()  { echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
 
-# if [[ -z "${PIPELINE_FILE}" || ! -f "${PIPELINE_FILE}" ]]; then
-#   echo "Usage: $0 <pipeline-yaml-file>"
-#   echo "Error: file not found: ${PIPELINE_FILE}"
-#   exit 1
-# fi
+# ---- Resolve PIPELINE_FILE ----
+PIPELINE_FILE="${1:-}"
 
-# ---- Check yq availability (Mike Farah yq v4) ----
-if ! command -v yq >/dev/null 2>&1; then
-  echo "ERROR: 'yq' (Mike Farah, v4+) is required but not installed."
-  echo "Install examples:"
-  echo "  macOS:  brew install yq"
-  echo "  Linux:  https://github.com/mikefarah/yq/#install"
+# Common locations to search when not provided
+AUTO_CANDIDATES=(
+  "target/azure-pipelines.yml"
+  "target/azure-pipelines.yaml"
+  "azure-pipelines.yml"
+  "azure-pipelines.yaml"
+)
+
+if [[ -z "${PIPELINE_FILE}" ]]; then
+  for f in "${AUTO_CANDIDATES[@]}"; do
+    if [[ -f "$f" ]]; then
+      PIPELINE_FILE="$f"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${PIPELINE_FILE}" || ! -f "${PIPELINE_FILE}" ]]; then
+  echo "Usage: $0 <pipeline-yaml-file>"
+  echo "Error: file not found: ${PIPELINE_FILE:-"(not provided)"}"
+  echo "Tried:"
+  printf '  - %s\n' "${AUTO_CANDIDATES[@]}"
+  echo "Current dir: $(pwd)"
   exit 1
 fi
 
+log "Working directory: $(pwd)"
+log "Pipeline file: ${PIPELINE_FILE}"
+
+# ---- Check yq availability (Mike Farah yq v4) ----
+if ! command -v yq >/dev/null 2>&1; then
+  die "'yq' (Mike Farah, v4+) is required but not installed."
+fi
+
+# Print yq version for diagnostics
+YQ_VER="$(yq --version 2>/dev/null || yq -V 2>/dev/null || true)"
+log "Using yq: ${YQ_VER:-unknown}"
+
 # ---- Create the replacement stage YAML in a temp file ----
 TMP_STAGE="$(mktemp)"
+cleanup() { rm -f "${TMP_STAGE}"; }
+trap cleanup EXIT
+
 cat > "${TMP_STAGE}" <<'YAML'
 stage: blackduckcoverity
 displayName: "Black Duck Scan (Synopsys Detect)"
@@ -84,33 +123,43 @@ jobs:
 YAML
 
 # ---- Ensure .stages exists ----
+# This guarantees .stages is an array, even if missing.
 yq -i '
   .stages = (.stages // [])
 ' "${PIPELINE_FILE}"
 
-# ---- Find index of stage named "coverity" (case-insensitive), matching either .stage or .name ----
+# ---- Find index of stage named "coverity" (case-insensitive) ----
+# NOTE: We avoid ascii_downcase because it requires newer yq versions (v4.21.1+). [1](https://github.com/mikefarah/yq/issues/1111)
+# Instead we use case-insensitive regex: test("(?i)^coverity$")
 COV_IDX="$(yq e '
   (.stages // [])
   | to_entries
-  | map(select((.value.stage // .value.name // "") | ascii_downcase == "coverity"))
+  | map(
+      select(
+        ((.value.stage // .value.name // "") | test("(?i)^coverity$"))
+      )
+    )
   | .[0].key
 ' "${PIPELINE_FILE}")"
 
+log "Coverity stage index (if any): ${COV_IDX}"
+
 # yq prints "null" if not found
 if [[ "${COV_IDX}" == "null" || -z "${COV_IDX}" ]]; then
-  echo "No 'coverity' stage found. Appending 'blackduckcoverity' stage."
+  log "No 'coverity' stage found. Appending 'blackduckcoverity' stage."
+
   # Append the new stage
   yq -i '
     .stages += [load(strenv(TMP_STAGE))]
   ' "${PIPELINE_FILE}" TMP_STAGE="${TMP_STAGE}"
+
 else
-  echo "Found 'coverity' stage at index ${COV_IDX}. Replacing with 'blackduckcoverity'."
+  log "Found 'coverity' stage at index ${COV_IDX}. Replacing with 'blackduckcoverity'."
 
   # Delete coverity at that index
   yq -i "del(.stages[${COV_IDX}])" "${PIPELINE_FILE}"
 
   # Insert new stage at same index
-  # Use env var for index; yq slicing requires numeric index
   export COV_IDX
   export TMP_STAGE
   yq -i '
@@ -122,5 +171,4 @@ else
   ' "${PIPELINE_FILE}"
 fi
 
-rm -f "${TMP_STAGE}"
-echo "Done. Updated: ${PIPELINE_FILE}"
+log "Done. Updated: ${PIPELINE_FILE}"
