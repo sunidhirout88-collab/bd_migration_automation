@@ -14,6 +14,7 @@ find target -maxdepth 2 -name "azure-pipelines.y*ml" -print
 # fi
 
 # ---- Check yq availability (Mike Farah yq v4) ----
+yq --version || yq -V
 if ! command -v yq >/dev/null 2>&1; then
   echo "ERROR: 'yq' (Mike Farah, v4+) is required but not installed."
   echo "Install examples:"
