@@ -178,7 +178,7 @@ YQ
 
 # Execute yq transformation
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
-
+cat "${PIPELINE_FILE}"
 # Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 
