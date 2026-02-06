@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage: ./replace_coverity_stage.sh azure-pipelines.yml
-PIPELINE_FILE="${1:-}"
+PIPELINE_FILE="azure-pipelines.yaml"
 
 if [[ -z "${PIPELINE_FILE}" || ! -f "${PIPELINE_FILE}" ]]; then
   echo "Usage: $0 <pipeline-yaml-file>"
