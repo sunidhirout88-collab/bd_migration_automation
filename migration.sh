@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PIPELINE_FILE="azure-pipelines.yml"
-
+FILE="${PIPELINE_FILE}"
 ls -la target
 find target -maxdepth 2 -name "azure-pipelines.y*ml" -print
 yq --version || yq -V
