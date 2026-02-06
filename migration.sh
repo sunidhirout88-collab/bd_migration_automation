@@ -5,7 +5,7 @@ set -euo pipefail
 PIPELINE_FILE="azure-pipelines.yml"
 
 # If your script runs from repo root but the YAML is inside target/, keep this:
-# cd target/
+cd target/
 # PIPELINE_FILE="azure-pipelines.yml"
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
