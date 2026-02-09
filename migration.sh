@@ -2,8 +2,6 @@
 set -euo pipefail
 
 PIPELINE_FILE="azure-pipelines.yml"
-
-# YAML is inside target/
 cd target/
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
@@ -19,18 +17,14 @@ fi
 echo "Using yq: $(yq --version)"
 echo "Updating: ${PIPELINE_FILE}"
 
-# Sanity checks
 yq e 'has("steps")' "${PIPELINE_FILE}"
 yq e '.steps | type' "${PIPELINE_FILE}"
 
-# Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# If prior runs created multi-document YAML (---), keep ONLY the first document
-# eval-all often causes multi-doc output unless you explicitly select one doc. [1](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)[2](https://linuxcommandlibrary.com/man/yq)
+# Clean up multi-document YAML created by older eval-all runs (keep only doc 0)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
-# --- Black Duck variables (map) ---
 BD_VARS="$(mktemp)"
 cat > "${BD_VARS}" <<'YAML'
 BLACKDUCK_URL: 'https://blackduck.mycompany.com'
@@ -39,7 +33,6 @@ BD_VERSION: '$(Build.SourceBranchName)'
 DETECT_VERSION: 'latest'
 YAML
 
-# --- Black Duck steps (sequence) ---
 BD_STEPS="$(mktemp)"
 cat > "${BD_STEPS}" <<'YAML'
 - task: JavaToolInstaller@0
@@ -51,7 +44,6 @@ cat > "${BD_STEPS}" <<'YAML'
 
 - bash: |
     set -euo pipefail
-
     echo "Downloading Synopsys Detect..."
     curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh
     chmod +x detect.sh
@@ -84,20 +76,15 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program file (robust coverity detection using tostring) ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def is_cov:
-  (tostring | ascii_downcase | test("coverity|\\bcov-"));
-
-def is_bd:
-  (tostring | ascii_downcase | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"));
+def is_cov: (tostring | ascii_downcase | test("coverity|\\bcov-"));
+def is_bd:  (tostring | ascii_downcase | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"));
 
 def delete_coverity_vars:
   if .variables == null then
     .
   elif (.variables | type) == "!!map" then
-   j
     .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
   elif (.variables | type) == "!!seq" then
     .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
@@ -149,14 +136,16 @@ else
 end
 YQ
 
-# ✅ Debug detection counts (single-line JSON object; avoids lexer issues)
+# Non-fatal debug
 echo "Debug detection counts (before edit):"
-yq e '{"cov_steps": ((.steps // []) | map(select(tostring|ascii_downcase|test("coverity|cov-"))) | length), "bd_steps": ((.steps // []) | map(select(tostring|ascii_downcase|test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))) | length)}' "${PIPELINE_FILE}"
+yq e '{
+  "cov_steps": ((.steps // []) | map(select(((tostring | ascii_downcase) | test("coverity|\\bcov-")))) | length),
+  "bd_steps":  ((.steps // []) | map(select(((tostring | ascii_downcase) | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url")))) | length)
+}' "${PIPELINE_FILE}" || echo "Debug detection skipped (non-fatal)"
 
-# ✅ Correct: edit only the pipeline file in-place (avoid eval-all multi-doc output) [3](https://sleeplessbeastie.eu/2024/01/26/how-to-work-with-yaml-files/)[1](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)
+# ✅ Correct: edit ONLY the pipeline file in place (avoid eval-all multi-doc output)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
 
-# Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 
 echo "✅ Done. Updated ${PIPELINE_FILE}"
@@ -168,7 +157,7 @@ grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -
 
 echo "Post-check (should show Black Duck):"
 grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
-  || echo "✅ Black Duck present"
+  || echo "❌ Black Duck not found (unexpected)"
 
 echo "Post-check (should be single-document YAML; no ---):"
 grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
