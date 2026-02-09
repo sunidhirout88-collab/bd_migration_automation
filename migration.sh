@@ -2,8 +2,6 @@
 set -euo pipefail
 
 PIPELINE_FILE="azure-pipelines.yml"
-
-# YAML is inside target/
 cd target/
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
@@ -26,7 +24,8 @@ yq e '.steps | type' "${PIPELINE_FILE}"
 # Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# If prior runs created multi-document YAML (---), keep only the first document
+# If prior runs created multi-document YAML (---), keep only doc 0
+# (eval-all can output multiple documents unless you explicitly select one) [2](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)[3](https://linuxcommandlibrary.com/man/yq)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -83,7 +82,7 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program file (robust matching using explicit step text) ---
+# --- yq program: ALWAYS remove Coverity; inject BD only if missing ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
 def step_text:
@@ -101,17 +100,8 @@ def step_text:
   ) | ascii_downcase;
 
 def is_coverity_any:
-  (
-    step_text
-    | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b")
-  )
-  or (
-    ((.displayName // "") | ascii_downcase | test("publish coverity"))
-    or ((.inputs.pathToPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
-    or ((.inputs.PathtoPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
-    or ((.inputs.artifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
-    or ((.inputs.ArtifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
-  );
+  step_text
+  | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b");
 
 def already_has_blackduck:
   (
@@ -149,36 +139,35 @@ def delete_coverity_vars:
     .
   end;
 
-def inject_blackduck_preserving_position:
-  (.steps | to_entries | map(select(.value | is_coverity_any)) | .[0].key) as $firstIdx
-  | (if $firstIdx == null then
-      # If no index found, append BD steps
+def remove_coverity_steps:
+  .steps |= map(select(is_coverity_any | not));
+
+def inject_bd_at_first_cov_or_end:
+  (
+    (.steps | to_entries | map(select(.value | is_coverity_any)) | .[0].key)
+  ) as $firstIdx
+  | if $firstIdx == null then
       .steps = (.steps + load(strenv(BD_STEPS)))
     else
       (.steps[0:$firstIdx]) as $prefix
-      | (.steps[$firstIdx:] | map(select(is_coverity_any | not))) as $suffix
-      | .steps = ($prefix + load(strenv(BD_STEPS)) + $suffix)
-    end);
+      | (.steps[$firstIdx:]) as $tail
+      | .steps = ($prefix + load(strenv(BD_STEPS)) + $tail)
+    end;
 
 if (has("steps") and (.steps | type == "!!seq")) then
-  if (.steps | any(. | is_coverity_any)) then
-    delete_coverity_vars
-    | merge_vars(load(strenv(BD_VARS)))
-    | (if already_has_blackduck then
-         # BD already exists: only remove coverity
-         .steps |= map(select(is_coverity_any | not))
-       else
-         inject_blackduck_preserving_position
-       end)
-  else
-    .
-  end
+  # Always remove Coverity vars + steps (if any)
+  delete_coverity_vars
+  | remove_coverity_steps
+  # Always merge BD vars (safe even if already present)
+  | merge_vars(load(strenv(BD_VARS)))
+  # Inject BD steps only if missing
+  | (if already_has_blackduck then . else inject_bd_at_first_cov_or_end end)
 else
   .
 end
 YQ
 
-# ✅ Apply transformation (single-file in-place edit)
+# ✅ Correct single-file in-place edit. This is the intended pattern for editing YAML files. [1](https://sleeplessbeastie.eu/2024/01/26/how-to-work-with-yaml-files/)[2](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
 
 # Cleanup
@@ -187,13 +176,13 @@ rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 echo "✅ Done. Updated ${PIPELINE_FILE}"
 echo "Backup saved as ${PIPELINE_FILE}.bak"
 
-echo "Post-check (should show NO cov-*):"
-grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -n "${PIPELINE_FILE}" \
-  || echo "✅ Coverity removed"
+echo "Post-check (ignore comments; should show NO real cov-* commands):"
+grep -nE "^[^#]*cov-build|^[^#]*cov-analyze|^[^#]*cov-format-errors|^[^#]*cov-commit-defects" -n "${PIPELINE_FILE}" \
+  || echo "✅ Coverity commands removed"
 
 echo "Post-check (should show Black Duck):"
 grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
-  || echo "✅ Black Duck present"
+  || echo "❌ Black Duck not found (unexpected)"
 
-echo "Post-check (should be single-document YAML; no ---):"
+echo "Post-check (single-document YAML; no ---):"
 grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
