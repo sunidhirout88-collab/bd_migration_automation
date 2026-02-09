@@ -24,7 +24,7 @@ yq e '.steps | type' "${PIPELINE_FILE}"
 # Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Keep only first YAML document (protect against old eval-all multi-doc output) [5](https://github.com/mikefarah/yq/issues/1642)[6](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
+# Keep only first YAML document (protect against prior eval-all multi-doc output) [3](https://github.com/mikefarah/yq/issues/1642)[4](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -81,31 +81,33 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq transformation program ---
-# Uses recursive descent to scan all string scalars within each step (covers multiline bash: | blocks). [1](https://deepwiki.com/mikefarah/yq)[2](https://nonbleedingedge.com/cheatsheets/yq.html)
+# --- yq transformation program (field-based, deterministic) ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def step_has(re):
+def step_str:
   (
-    [ .. | select(tag == "!!str") | ascii_downcase ]
-    | any(test(re))
-  );
+    (.displayName // "") + "\n" +
+    (.task // "") + "\n" +
+    (.bash // "") + "\n" +
+    (.script // "") + "\n" +
+    (.pwsh // "") + "\n" +
+    (.powershell // "") + "\n" +
+    ((.inputs // {}) | tostring)
+  ) | ascii_downcase;
 
-# SUPER robust: any mention of cov-* or coverity anywhere in the step
 def is_cov:
-  step_has("coverity|cov-");
+  step_str | test("coverity|\\bcov-");
 
-# BD detection
 def is_bd:
-  step_has("black duck|synopsys detect|detect\\.sh|blackduck\\.url|blackduck\\.api\\.token");
+  step_str | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url");
 
 def delete_cov_vars:
   if .variables == null then
     .
   elif (.variables | type) == "!!map" then
-    .variables |= with_entries(select(((.key | tostring) | test("^COVERITY_")) | not))
+    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
   elif (.variables | type) == "!!seq" then
-    .variables |= map(select((((.name // "") | tostring) | test("^COVERITY_")) | not))
+    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
   else
     .
   end;
@@ -121,33 +123,25 @@ def merge_vars(new):
     .
   end;
 
-def first_cov_idx(steps):
-  (steps | to_entries | map(select(.value | is_cov)) | .[0].key);
-
 if (has("steps") and (.steps | type) == "!!seq") then
   (.steps) as $orig
   | ($orig | any(. | is_bd)) as $bdAlready
-  | (first_cov_idx($orig)) as $covIdx
 
-  # 1) Always remove COVERITY_* vars and merge BD vars
+  # Always remove COVERITY_* vars and merge BD vars
   | delete_cov_vars
   | merge_vars(load(strenv(BD_VARS)))
 
-  # 2) Always remove Coverity steps
-  | (.steps = ($orig | map(select(is_cov | not))))
+  # Always remove Coverity steps
+  | .steps = ($orig | map(select(is_cov | not)))
 
-  # 3) Inject BD steps only if missing
+  # Inject BD steps if missing: insert after step 0 (usually checkout), else append
   | (if $bdAlready then
        .
      else
-       if $covIdx == null then
-         .steps = (.steps + load(strenv(BD_STEPS)))
+       if (.steps | length) > 0 then
+         .steps = (.steps[0:1] + load(strenv(BD_STEPS)) + .steps[1:])
        else
-         .steps = (
-           $orig[0:$covIdx]
-           + load(strenv(BD_STEPS))
-           + ($orig[$covIdx:] | map(select(is_cov | not)))
-         )
+         .steps = (load(strenv(BD_STEPS)))
        end
      end)
 else
@@ -162,7 +156,7 @@ fi
 
 echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
 
-# In-place edit is the intended yq pattern for updating a single YAML file. [3](https://github.com/mikefarah/yq/issues/1315)[4](https://linuxcommandlibrary.com/man/yq)
+# In-place edit is the intended yq pattern for updating one YAML file. [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
 
 echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
@@ -177,7 +171,7 @@ echo "Post-check (ignore comments; should show NO real cov-* commands):"
 grep -nE '^[^#]*\bcov-' -n "${PIPELINE_FILE}" || echo "✅ Coverity commands removed"
 
 echo "Post-check (should show Black Duck):"
-grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" || echo "❌ Black Duck not found (unexpected)"
+grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" || echo "✅ Black Duck present"
 
 echo "Post-check (single-document YAML; no ---):"
 grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
