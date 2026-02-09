@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Location of the pipeline YAML (adjust if needed) ---
 PIPELINE_FILE="azure-pipelines.yml"
 
-# If your script runs from repo root but the YAML is inside target/, keep this:
+# YAML is inside target/
 cd target/
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
@@ -24,11 +23,11 @@ echo "Updating: ${PIPELINE_FILE}"
 yq e 'has("steps")' "${PIPELINE_FILE}"
 yq e '.steps | type' "${PIPELINE_FILE}"
 
-# --- Backup ---
+# Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# --- IMPORTANT: If prior runs created multi-document YAML (---), keep ONLY the first document ---
-# This prevents "extra docs" from old eval-all runs from lingering in azure-pipelines.yml
+# If prior runs created multi-document YAML (---), keep ONLY the first document
+# eval-all often causes multi-doc output unless you explicitly select one doc. [1](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)[2](https://linuxcommandlibrary.com/man/yq)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -37,11 +36,10 @@ cat > "${BD_VARS}" <<'YAML'
 BLACKDUCK_URL: 'https://blackduck.mycompany.com'
 BD_PROJECT: 'my-app'
 BD_VERSION: '$(Build.SourceBranchName)'
-DETECT_VERSION: 'latest'   # or pin e.g. 9.10.0
+DETECT_VERSION: 'latest'
 YAML
 
 # --- Black Duck steps (sequence) ---
-# IMPORTANT: No checkout step here because your YAML already has one.
 BD_STEPS="$(mktemp)"
 cat > "${BD_STEPS}" <<'YAML'
 - task: JavaToolInstaller@0
@@ -86,8 +84,7 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program file ---
-# Robust detection: treat a step as Coverity if its whole YAML text contains "coverity" or "cov-"
+# --- yq program file (robust coverity detection using tostring) ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
 def is_cov:
@@ -100,6 +97,7 @@ def delete_coverity_vars:
   if .variables == null then
     .
   elif (.variables | type) == "!!map" then
+   j
     .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
   elif (.variables | type) == "!!seq" then
     .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
@@ -134,7 +132,7 @@ def inject_bd_at_first_cov:
       | .steps = ($prefix + load(strenv(BD_STEPS)) + $suffix)
     end;
 
-if (has("steps") and (.steps | type == "!!seq")) then
+if (has("steps") and (.steps | type) == "!!seq") then
   if (.steps | any(. | is_cov)) then
     delete_coverity_vars
     | merge_vars(load(strenv(BD_VARS)))
@@ -151,15 +149,11 @@ else
 end
 YQ
 
-# --- Debug detection counts (helps confirm matching) ---
+# ✅ Debug detection counts (single-line JSON object; avoids lexer issues)
 echo "Debug detection counts (before edit):"
-yq e '{
-  cov_steps: (.steps // [] | map(select(tostring|ascii_downcase|test("coverity|\\bcov-"))) | length),
-  bd_steps:  (.steps // [] | map(select(tostring|ascii_downcase|test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))) | length)
-}' "${PIPELINE_FILE}"
+yq e '{"cov_steps": ((.steps // []) | map(select(tostring|ascii_downcase|test("coverity|cov-"))) | length), "bd_steps": ((.steps // []) | map(select(tostring|ascii_downcase|test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))) | length)}' "${PIPELINE_FILE}"
 
-# ✅ Correct command: edit ONLY the pipeline file in place (avoid eval-all multi-doc output)
-# yq eval -i modifies a file in place, which is the right pattern for single-file edits. [3](https://sleeplessbeastie.eu/2024/01/26/how-to-work-with-yaml-files/)[1](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)
+# ✅ Correct: edit only the pipeline file in-place (avoid eval-all multi-doc output) [3](https://sleeplessbeastie.eu/2024/01/26/how-to-work-with-yaml-files/)[1](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
 
 # Cleanup
@@ -174,7 +168,7 @@ grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -
 
 echo "Post-check (should show Black Duck):"
 grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
-  || echo "❌ Black Duck not found (unexpected)"
+  || echo "✅ Black Duck present"
 
 echo "Post-check (should be single-document YAML; no ---):"
 grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
