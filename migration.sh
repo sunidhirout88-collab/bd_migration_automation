@@ -21,11 +21,13 @@ fi
 echo "Using yq: $(yq --version)"
 echo "PWD: $(pwd)"
 echo "Editing: ${PIPELINE_FILE}"
+echo "SCRIPT: $0"
+echo "SCRIPT HASH: $(sha256sum "$0" | awk '{print $1}')"
 
 # --- Backup ---
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Keep only first YAML document (protect against old eval-all multi-doc output)
+# Keep only first YAML document (guards against old eval-all multi-doc output). [3](https://github.com/mikefarah/yq/issues/1642)[4](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -82,11 +84,15 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program ---
+# --- yq program: remove Coverity + inject Black Duck if missing ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
 def low(x): (x // "" | tostring | ascii_downcase);
 
+# This blob targets EXACTLY where Coverity appears in your YAML:
+# - bash/script bodies contain cov-*
+# - displayName contains "Coverity..."
+# - publish steps contain coverity in artifactName/pathToPublish
 def blob:
   (
     low(.displayName) + "\n" +
@@ -103,10 +109,16 @@ def blob:
   );
 
 def is_cov:
-  (blob | contains("cov-")) or (blob | contains("coverity")) or (blob | contains("$(coverity"));
+  (blob | contains("cov-"))
+  or (blob | contains("coverity"))
+  or (blob | contains("$(coverity"))
+  or (blob | contains("$(coverity_"));
 
 def is_bd:
-  (blob | contains("detect.sh")) or (blob | contains("synopsys detect")) or (blob | contains("blackduck.url")) or (blob | contains("black duck"));
+  (blob | contains("detect.sh"))
+  or (blob | contains("blackduck.url"))
+  or (blob | contains("synopsys detect"))
+  or (blob | contains("black duck"));
 
 def delete_cov_vars:
   if .variables == null then
@@ -133,9 +145,17 @@ def merge_vars(new):
 if (has("steps") and (.steps | type) == "!!seq") then
   (.steps) as $orig
   | ($orig | any(. | is_bd)) as $bdAlready
+
+  # 1) Remove COVERITY_* variables
   | delete_cov_vars
+
+  # 2) Remove all Coverity steps
   | .steps = ($orig | map(select(is_cov | not)))
+
+  # 3) Merge BD variables
   | merge_vars(load(strenv(BD_VARS)))
+
+  # 4) Inject BD steps only if missing: insert after step 0 (checkout), else append
   | (if $bdAlready then
        .
      else
@@ -150,24 +170,37 @@ else
 end
 YQ
 
-# ---- Proof checks (these should not error now) ----
+# --- Non-fatal debug counts (pre) ---
 echo "Coverity step count BEFORE:"
-yq e '(.steps // []) | map(select((.bash // "" | ascii_downcase) | contains("cov-"))) | length' "${PIPELINE_FILE}"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" \
+  || echo "DEBUG count failed (ignored)"
 
 echo "Black Duck step count BEFORE:"
-yq e '(.steps // []) | map(select((.bash // "" | ascii_downcase) | contains("detect.sh"))) | length' "${PIPELINE_FILE}"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\\.sh|blackduck\\.url|synopsys detect"))) | length' "${PIPELINE_FILE}" \
+  || echo "DEBUG count failed (ignored)"
 
 echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
+
+# In-place edit (recommended for single-file edits). [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
+
 echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
 
+# --- Non-fatal debug counts (post) ---
 echo "Coverity step count AFTER:"
-yq e '(.steps // []) | map(select((.bash // "" | ascii_downcase) | contains("cov-"))) | length' "${PIPELINE_FILE}"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" \
+  || echo "DEBUG count failed (ignored)"
 
 echo "Black Duck step count AFTER:"
-yq e '(.steps // []) | map(select((.bash // "" | ascii_downcase) | contains("detect.sh"))) | length' "${PIPELINE_FILE}"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\\.sh|blackduck\\.url|synopsys detect"))) | length' "${PIPELINE_FILE}" \
+  || echo "DEBUG count failed (ignored)"
 
+# Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
+
+echo "✅ Done. Updated ${PIPELINE_FILE}"
+cat "${PIPELINE_FILE}"
+echo "Backup saved as ${PIPELINE_FILE}.bak"
 
 echo "Post-check (ignore comments; should show NO real cov-* commands):"
 grep -nE '^[^#]*\bcov-' -n "${PIPELINE_FILE}" || echo "✅ Coverity commands removed"
