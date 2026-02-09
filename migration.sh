@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+TARGET_BRANCH="${TARGET_BRANCH:-}"      # If empty, script tries to detect current branch
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"        # GitHub PAT (should be injected as secret env var)
 
+# Optional: commit message
+COMMIT_MESSAGE="${COMMIT_MESSAGE:-removed coverity}"
 # ---------- Resolve script location safely ----------
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
