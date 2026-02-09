@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PIPELINE_FILE="azure-pipelines.yml"
+# If azure-pipelines.yml is inside target/
 cd target/
+
+PIPELINE_FILE="azure-pipelines.yml"
+SCRIPT_SELF="../migration.sh"   # adjust if you store it elsewhere
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
   echo "ERROR: Pipeline file not found: ${PIPELINE_FILE}"
@@ -15,12 +18,22 @@ if ! command -v yq >/dev/null 2>&1; then
 fi
 
 echo "Using yq: $(yq --version)"
-echo "Updating: ${PIPELINE_FILE}"
+echo "PWD: $(pwd)"
+echo "Editing: ${PIPELINE_FILE}"
 
-# Backup
+# --- Prove which script is running (hash + first lines) ---
+if [[ -f "${SCRIPT_SELF}" ]]; then
+  echo "SCRIPT HASH: $(sha256sum "${SCRIPT_SELF}" | awk '{print $1}')"
+  echo "SCRIPT HEAD:"
+  sed -n '1,15p' "${SCRIPT_SELF}"
+else
+  echo "WARN: Cannot find ${SCRIPT_SELF} to print script hash (adjust SCRIPT_SELF path)."
+fi
+
+# --- Backup ---
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Keep only first YAML document (protects against old eval-all multi-doc output). [3](https://github.com/mikefarah/yq/issues/1642)[4](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
+# Keep only first YAML document (avoid multi-doc leftovers from older eval-all usage) [3](https://github.com/mikefarah/yq/issues/1642)[4](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -77,34 +90,41 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq transformation program (FIELD-BASED + contains(), matches your YAML reliably) ---
+# ---- yq program tailored to YOUR Coverity YAML ----
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
 def low(x): (x // "" | tostring | ascii_downcase);
 
-# Coverity step detection for your exact pipeline:
-# - bash/script contains cov-*
-# - displayName contains "coverity"
-# - publish inputs/artifactName include coverity
-def is_cov:
+# A step "blob" covering exactly the places Coverity appears in your YAML:
+def blob:
   (
-    (low(.displayName) | contains("coverity"))
-    or (low(.bash) | contains("cov-"))
-    or (low(.script) | contains("cov-"))
-    or (low(.pwsh) | contains("cov-"))
-    or (low(.powershell) | contains("cov-"))
-    or (low(.inputs.pathToPublish) | contains("coverity"))
-    or (low(.inputs.PathtoPublish) | contains("coverity"))
-    or (low(.inputs.artifactName) | contains("coverity"))
-    or (low(.inputs.ArtifactName) | contains("coverity"))
+    low(.displayName) + "\n" +
+    low(.task) + "\n" +
+    low(.bash) + "\n" +
+    low(.script) + "\n" +
+    low(.pwsh) + "\n" +
+    low(.powershell) + "\n" +
+    low(.inputs.pathToPublish) + "\n" +
+    low(.inputs.PathtoPublish) + "\n" +
+    low(.inputs.artifactName) + "\n" +
+    low(.inputs.ArtifactName) + "\n" +
+    low((.inputs // {}) | tostring)
   );
 
-# Black Duck detection
+def is_cov:
+  (
+    (blob | contains("cov-"))
+    or (blob | contains("coverity"))
+    or (blob | contains("$(coverity"))
+    or (blob | contains("$(coverity_"))
+  );
+
 def is_bd:
   (
-    (low(.displayName) | contains("black duck") or contains("synopsys detect"))
-    or (low(.bash) | contains("detect.sh") or contains("blackduck.url"))
-    or (low(.script) | contains("detect.sh") or contains("blackduck.url"))
+    (blob | contains("detect.sh"))
+    or (blob | contains("synopsys detect"))
+    or (blob | contains("blackduck.url"))
+    or (blob | contains("black duck"))
   );
 
 def delete_cov_vars:
@@ -133,14 +153,16 @@ if (has("steps") and (.steps | type) == "!!seq") then
   (.steps) as $orig
   | ($orig | any(. | is_bd)) as $bdAlready
 
-  # Always remove Coverity vars + Coverity steps
+  # 1) Remove COVERITY_* vars
   | delete_cov_vars
+
+  # 2) Remove Coverity steps
   | .steps = ($orig | map(select(is_cov | not)))
 
-  # Always merge BD vars
+  # 3) Merge BD vars
   | merge_vars(load(strenv(BD_VARS)))
 
-  # Inject BD steps only if missing: insert after first step (checkout), else append
+  # 4) Inject BD steps only if missing (insert right after checkout step)
   | (if $bdAlready then
        .
      else
@@ -155,10 +177,26 @@ else
 end
 YQ
 
-# Apply in-place edit (right pattern for single file). [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
-yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
+# --- Detection proof before edit ---
+echo "Coverity step count BEFORE:"
+yq e '(.steps // []) | map(select(((.bash // "" ) | ascii_downcase) | contains("cov-") )) | length' "${PIPELINE_FILE}"
+echo "Black Duck step count BEFORE:"
+yq e '(.steps // []) | map(select(((.bash // "" ) | ascii_downcase) | contains("detect.sh") )) | length' "${PIPELINE_FILE}"
 
-# Cleanup
+echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
+yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"  # in-place edit recommended [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
+echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
+
+echo "Diff vs backup:"
+diff -u "${PIPELINE_FILE}.bak" "${PIPELINE_FILE}" || true
+
+# --- Detection proof after edit ---
+echo "Coverity step count AFTER:"
+yq e '(.steps // []) | map(select(((.bash // "" ) | ascii_downcase) | contains("cov-") )) | length' "${PIPELINE_FILE}"
+echo "Black Duck step count AFTER:"
+yq e '(.steps // []) | map(select(((.bash // "" ) | ascii_downcase) | contains("detect.sh") )) | length' "${PIPELINE_FILE}"
+
+# Cleanup temp files
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 
 echo "✅ Done. Updated ${PIPELINE_FILE}"
