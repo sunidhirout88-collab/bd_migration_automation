@@ -185,6 +185,9 @@ rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 echo "✅ Done. Updated ${PIPELINE_FILE}"
 echo "Backup saved as ${PIPELINE_FILE}.bak"
 
+ls -la azure-pipelines.yml azure-pipelines.yml.bak 2>/dev/null || true
+ls -la target/azure-pipelines.yml target/azure-pipelines.yml.bak 2>/dev/null || true
+
 echo "Post-check (should show NO cov-*):"
 grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -n "${PIPELINE_FILE}" || echo "✅ Coverity removed"
 
