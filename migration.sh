@@ -2,6 +2,8 @@
 set -euo pipefail
 
 PIPELINE_FILE="azure-pipelines.yml"
+
+# YAML is inside target/
 cd target/
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
@@ -24,7 +26,7 @@ yq e '.steps | type' "${PIPELINE_FILE}"
 # Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Ensure single-document YAML (protects against old eval-all multi-doc output). [5](https://github.com/mikefarah/yq/issues/1642)[6](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
+# Keep only first YAML document (protect against old eval-all multi-doc output) [2](https://github.com/mikefarah/yq/issues/1642)[3](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -81,25 +83,40 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# Optional: prove load() works (helps debugging quickly)
+# Optional: prove load() works (uses env var + load, supported in yq v4) [4](https://linuxcommandlibrary.com/man/yq)[3](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
 yq -n 'load(strenv(BD_VARS))' >/dev/null
 yq -n 'load(strenv(BD_STEPS))' >/dev/null
 
-# --- yq transformation program ---
-# Key idea: detect Coverity/BlackDuck by recursively scanning all string scalars in each step. [1](https://deepwiki.com/mikefarah/yq)[2](https://nonbleedingedge.com/cheatsheets/yq.html)
+# --- yq transformation program (robust Coverity matching) ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def step_has(re):
+def lower(x): (x // "") | tostring | ascii_downcase;
+
+# Match Coverity by inspecting the places it actually appears in Azure Pipelines YAML:
+# - bash/script blocks (cov-build/cov-analyze/etc)
+# - displayName containing coverity
+# - PublishBuildArtifacts inputs using coverity names/paths
+def is_cov:
   (
-    [ .. | select(tag == "!!str") | ascii_downcase ]
-    | any(test(re))
+    (lower(.displayName) | test("\\bcoverity\\b"))
+    or (lower(.task) | test("\\bcoverity\\b"))
+    or (lower(.bash) | test("\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b"))
+    or (lower(.script) | test("\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b"))
+    or (lower(.pwsh) | test("\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b"))
+    or (lower(.powershell) | test("\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b"))
+    or (lower(.inputs.pathToPublish) | test("coverity|\\$\\(coverity_"))
+    or (lower(.inputs.PathtoPublish) | test("coverity|\\$\\(coverity_"))
+    or (lower(.inputs.artifactName) | test("\\bcoverity\\b"))
+    or (lower(.inputs.ArtifactName) | test("\\bcoverity\\b"))
   );
 
-def is_cov:
-  step_has("coverity|cov-build|cov-analyze|cov-format-errors|cov-commit-defects|cov-commit|cov-import-scm|cov-run-desktop|cov-manage-im");
-
 def is_bd:
-  step_has("black duck|synopsys detect|detect\\.sh|blackduck\\.url");
+  (
+    (lower(.displayName) | test("black duck|synopsys detect"))
+    or (lower(.bash) | test("detect\\.sh|blackduck\\.url|synopsys detect"))
+    or (lower(.script) | test("detect\\.sh|blackduck\\.url|synopsys detect"))
+    or ((.inputs // {}) | tostring | ascii_downcase | test("blackduck|detect\\.sh|synopsys"))
+  );
 
 def delete_cov_vars:
   if .variables == null then
@@ -123,32 +140,29 @@ def merge_vars(new):
     .
   end;
 
-def first_cov_idx(steps):
-  (steps | to_entries | map(select(.value | is_cov)) | .[0].key);
-
 if (has("steps") and (.steps | type) == "!!seq") then
   (.steps) as $orig
   | ($orig | any(. | is_bd)) as $bdAlready
-  | (first_cov_idx($orig)) as $covIdx
+  | ($orig | to_entries | map(select(.value | is_cov)) | .[0].key) as $firstCovIdx
 
-  # Always: remove COVERITY_* vars and merge BD vars
+  # Always remove COVERITY_* variables and merge BD vars
   | delete_cov_vars
   | merge_vars(load(strenv(BD_VARS)))
 
-  # Always: remove Coverity steps
+  # Remove Coverity steps everywhere
   | (.steps = ($orig | map(select(is_cov | not))))
 
-  # Inject BD steps only if missing
+  # Inject BD only if missing
   | (if $bdAlready then
        .
      else
-       if $covIdx == null then
+       if $firstCovIdx == null then
          .steps = (.steps + load(strenv(BD_STEPS)))
        else
          .steps = (
-           $orig[0:$covIdx]
+           $orig[0:$firstCovIdx]
            + load(strenv(BD_STEPS))
-           + ($orig[$covIdx:] | map(select(is_cov | not)))
+           + ($orig[$firstCovIdx:] | map(select(is_cov | not)))
          )
        end
      end)
@@ -157,27 +171,14 @@ else
 end
 YQ
 
-# Ensure YQ program exists and is non-empty
 if [[ ! -s "${YQ_PROG}" ]]; then
   echo "ERROR: YQ program file is empty: ${YQ_PROG}"
   exit 1
 fi
 
 echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
-
-# Edit pipeline in place (recommended for single-file edits). [3](https://github.com/mikefarah/yq/issues/1315)[4](https://linuxcommandlibrary.com/man/yq)
-yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
-
+yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"   # in-place edit is the intended pattern [1](https://github.com/mikefarah/yq/issues/1315)[4](https://linuxcommandlibrary.com/man/yq)
 echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
-
-echo "Diff vs backup:"
-set +e
-diff -u "${PIPELINE_FILE}.bak" "${PIPELINE_FILE}"
-rc=$?
-set -e
-if [[ $rc -eq 0 ]]; then
-  echo "(no diff)"
-fi
 
 # Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
