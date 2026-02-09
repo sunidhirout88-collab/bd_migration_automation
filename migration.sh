@@ -84,22 +84,19 @@ export BD_VARS BD_STEPS
 # --- yq transformation program (field-based, deterministic) ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def step_str:
-  (
-    (.displayName // "") + "\n" +
-    (.task // "") + "\n" +
-    (.bash // "") + "\n" +
-    (.script // "") + "\n" +
-    (.pwsh // "") + "\n" +
-    (.powershell // "") + "\n" +
-    ((.inputs // {}) | tostring)
-  ) | ascii_downcase;
+# Robust matching for Azure DevOps steps:
+# Scan ALL string scalars in a step (including multiline bash/script) and regex-match.
+# This approach is recommended in yq v4: use recursive descent .. filtered to !!str,
+# and wrap it in parentheses to preserve context. [1](https://deepwiki.com/mikefarah/yq)[2](https://nonbleedingedge.com/cheatsheets/yq.html)
+
+def step_strings:
+  ([ .. | select(tag == "!!str") | ascii_downcase ]);
 
 def is_cov:
-  step_str | test("coverity|\\bcov-");
+  (step_strings | any(test("coverity|\\bcov-")));
 
 def is_bd:
-  step_str | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url");
+  (step_strings | any(test("black duck|synopsys detect|detect\\.sh|blackduck\\.url|blackduck\\.api\\.token")));
 
 def delete_cov_vars:
   if .variables == null then
@@ -134,20 +131,21 @@ if (has("steps") and (.steps | type) == "!!seq") then
   # Always remove Coverity steps
   | .steps = ($orig | map(select(is_cov | not)))
 
-  # Inject BD steps if missing: insert after step 0 (usually checkout), else append
+  # Inject BD steps only if missing:
   | (if $bdAlready then
        .
      else
        if (.steps | length) > 0 then
          .steps = (.steps[0:1] + load(strenv(BD_STEPS)) + .steps[1:])
        else
-         .steps = (load(strenv(BD_STEPS)))
+         .steps = load(strenv(BD_STEPS))
        end
      end)
 else
   .
 end
 YQ
+
 
 if [[ ! -s "${YQ_PROG}" ]]; then
   echo "ERROR: YQ program file is empty: ${YQ_PROG}"
