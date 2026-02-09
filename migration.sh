@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Location of the pipeline YAML (adjust if needed) ---
 PIPELINE_FILE="azure-pipelines.yml"
+
+# If your script runs from repo root but the YAML is inside target/, keep this:
 cd target/
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
@@ -21,8 +24,12 @@ echo "Updating: ${PIPELINE_FILE}"
 yq e 'has("steps")' "${PIPELINE_FILE}"
 yq e '.steps | type' "${PIPELINE_FILE}"
 
-# Backup
+# --- Backup ---
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
+
+# --- IMPORTANT: If prior runs created multi-document YAML (---), keep ONLY the first document ---
+# This prevents "extra docs" from old eval-all runs from lingering in azure-pipelines.yml
+yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
 BD_VARS="$(mktemp)"
@@ -30,10 +37,11 @@ cat > "${BD_VARS}" <<'YAML'
 BLACKDUCK_URL: 'https://blackduck.mycompany.com'
 BD_PROJECT: 'my-app'
 BD_VERSION: '$(Build.SourceBranchName)'
-DETECT_VERSION: 'latest'
+DETECT_VERSION: 'latest'   # or pin e.g. 9.10.0
 YAML
 
 # --- Black Duck steps (sequence) ---
+# IMPORTANT: No checkout step here because your YAML already has one.
 BD_STEPS="$(mktemp)"
 cat > "${BD_STEPS}" <<'YAML'
 - task: JavaToolInstaller@0
@@ -78,62 +86,15 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program (modern yq supports def) ---
+# --- yq program file ---
+# Robust detection: treat a step as Coverity if its whole YAML text contains "coverity" or "cov-"
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def step_text:
-  (
-    (.displayName // "") + "\n" +
-    (.task // "") + "\n" +
-    (.bash // "") + "\n" +
-    (.script // "") + "\n" +
-    (.pwsh // "") + "\n" +
-    (.powershell // "") + "\n" +
-    (.inputs.script // "") + "\n" +
-    (.inputs.inlineScript // "") + "\n" +
-    (.inputs.arguments // "") + "\n" +
-    (.inputs | tostring)
-  ) | ascii_downcase;
+def is_cov:
+  (tostring | ascii_downcase | test("coverity|\\bcov-"));
 
-def is_coverity_step:
-  step_text
-  | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b");
-
-def is_coverity_publish:
-  (
-    ((.displayName // "") | ascii_downcase | test("publish coverity"))
-    or ((.inputs.pathToPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
-    or ((.inputs.PathtoPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
-    or ((.inputs.artifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
-    or ((.inputs.ArtifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
-  );
-
-def is_coverity_any:
-  is_coverity_step or is_coverity_publish;
-
-def already_has_blackduck:
-  (
-    (.steps // [])
-    | map(
-        (
-          (.displayName // "") + " " +
-          (.bash // .script // .pwsh // .powershell // "") + " " +
-          (.inputs.script // .inputs.inlineScript // "")
-        ) | ascii_downcase
-      )
-    | any(test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))
-  );
-
-def merge_vars(new):
-  if .variables == null then
-    .variables = new
-  elif (.variables | type) == "!!map" then
-    .variables = (.variables * new)
-  elif (.variables | type) == "!!seq" then
-    .variables += (new | to_entries | map({"name": .key, "value": .value}))
-  else
-    .
-  end;
+def is_bd:
+  (tostring | ascii_downcase | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"));
 
 def delete_coverity_vars:
   if .variables == null then
@@ -146,22 +107,41 @@ def delete_coverity_vars:
     .
   end;
 
-def inject_blackduck_preserving_position:
-  (.steps | to_entries | map(select(.value | is_coverity_any)) | .[0].key) as $firstIdx
-  | (if $firstIdx == null then . else
-      (.steps[0:$firstIdx]) as $prefix
-      | (.steps[$firstIdx:] | map(select(is_coverity_any | not))) as $suffix
+def merge_vars(new):
+  if .variables == null then
+    .variables = new
+  elif (.variables | type) == "!!map" then
+    .variables = (.variables * new)
+  elif (.variables | type) == "!!seq" then
+    .variables += (new | to_entries | map({"name": .key, "value": .value}))
+  else
+    .
+  end;
+
+def first_cov_idx:
+  (.steps | to_entries | map(select(.value | is_cov)) | .[0].key);
+
+def remove_cov_steps:
+  .steps |= map(select((. | is_cov) | not));
+
+def inject_bd_at_first_cov:
+  (first_cov_idx) as $i
+  | if $i == null then
+      .steps = (.steps + load(strenv(BD_STEPS)))
+    else
+      (.steps[0:$i]) as $prefix
+      | (.steps[$i:] | map(select((. | is_cov) | not))) as $suffix
       | .steps = ($prefix + load(strenv(BD_STEPS)) + $suffix)
-    end);
+    end;
 
 if (has("steps") and (.steps | type == "!!seq")) then
-  if (.steps | any(. | is_coverity_any)) then
+  if (.steps | any(. | is_cov)) then
     delete_coverity_vars
     | merge_vars(load(strenv(BD_VARS)))
-    | (if already_has_blackduck then
-         .steps |= map(select(is_coverity_any | not))
+    | (if (.steps | any(. | is_bd)) then
+         remove_cov_steps
        else
-         inject_blackduck_preserving_position
+         inject_bd_at_first_cov
        end)
   else
     .
@@ -171,13 +151,16 @@ else
 end
 YQ
 
-# DEBUG: confirm program and inputs are non-empty
-echo "BD_VARS lines: $(wc -l < "${BD_VARS}")"
-echo "BD_STEPS lines: $(wc -l < "${BD_STEPS}")"
-echo "YQ_PROG lines:  $(wc -l < "${YQ_PROG}")"
+# --- Debug detection counts (helps confirm matching) ---
+echo "Debug detection counts (before edit):"
+yq e '{
+  cov_steps: (.steps // [] | map(select(tostring|ascii_downcase|test("coverity|\\bcov-"))) | length),
+  bd_steps:  (.steps // [] | map(select(tostring|ascii_downcase|test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))) | length)
+}' "${PIPELINE_FILE}"
 
-# ✅ Correct command: edit one file in place (avoid eval-all multi-doc output)
-yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"   # eval edits the pipeline only [2](https://sleeplessbeastie.eu/2024/01/26/how-to-work-with-yaml-files/)[1](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)
+# ✅ Correct command: edit ONLY the pipeline file in place (avoid eval-all multi-doc output)
+# yq eval -i modifies a file in place, which is the right pattern for single-file edits. [3](https://sleeplessbeastie.eu/2024/01/26/how-to-work-with-yaml-files/)[1](https://docs.zarf.dev/commands/zarf_tools_yq_eval-all/)
+yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
 
 # Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
@@ -191,4 +174,7 @@ grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -
 
 echo "Post-check (should show Black Duck):"
 grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
-  || echo "✅ Black Duck present"
+  || echo "❌ Black Duck not found (unexpected)"
+
+echo "Post-check (should be single-document YAML; no ---):"
+grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
