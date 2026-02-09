@@ -24,27 +24,7 @@ echo "Updating: ${PIPELINE_FILE}"
 yq e 'has("steps")' azure-pipelines.yml
 yq e '.steps | type' azure-pipelines.yml
 
-yq e '
-(.steps // [])
-| to_entries
-| map(
-    select(
-      (
-        (
-          (.value.displayName // "") + " " +
-          (.value.task // "") + " " +
-          (.value.bash // "") + " " +
-          (.value.script // "") + " " +
-          (.value.pwsh // "") + " " +
-          (.value.powershell // "") + " " +
-          ((.value.inputs // {}) | tostring)
-        ) | ascii_downcase
-      )
-      | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcoverity\\b")
-    )
-  )
-| map(.key)
-' azure-pipelines.yml
+
 
 # --- Backup ---
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
@@ -108,101 +88,186 @@ YAML
 export BD_VARS BD_STEPS
 
 # --- yq program file (prevents lexer/quoting issues) ---
+# --- yq program file (yq v4.5.2 compatible: no 'def') ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def step_text:
-  (
-    (.displayName // "") + "\n" +
-    (.task // "") + "\n" +
-    (.bash // "") + "\n" +
-    (.script // "") + "\n" +
-    (.pwsh // "") + "\n" +
-    (.powershell // "") + "\n" +
-    (.inputs.script // "") + "\n" +
-    (.inputs.inlineScript // "") + "\n" +
-    (.inputs.arguments // "") + "\n" +
-    (.inputs | tostring)
-  ) | ascii_downcase;
+# Inputs:
+#   fileIndex==0 -> pipeline YAML
+#   fileIndex==1 -> BD_VARS (map)
+#   fileIndex==2 -> BD_STEPS (seq)
 
-def is_coverity_step:
-  step_text
-  | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b");
+select(fileIndex==0) as $p
+| select(fileIndex==1) as $newVars
+| select(fileIndex==2) as $newSteps
+| $p
+| (
+    "coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b" as $covRe
+    | "black duck|synopsys detect|detect\\.sh|blackduck\\.url" as $bdRe
 
-def is_coverity_publish:
-  (
-    ((.displayName // "") | ascii_downcase | test("publish coverity"))
-    or ((.inputs.pathToPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
-    or ((.inputs.PathtoPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
-    or ((.inputs.artifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
-    or ((.inputs.ArtifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
-  );
+    | if (has("steps") and (.steps | type) == "!!seq") then
 
-def is_coverity_any:
-  is_coverity_step or is_coverity_publish;
-
-def already_has_blackduck:
-  (
-    (.steps // [])
-    | map(
+        # --- Detect if any step looks like Coverity ---
         (
-          (.displayName // "") + " " +
-          (.bash // .script // .pwsh // .powershell // "") + " " +
-          (.inputs.script // .inputs.inlineScript // "")
-        ) | ascii_downcase
-      )
-    | any(test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))
-  );
+          (.steps // [])
+          | map(
+              (
+                (.displayName // "") + "\n" +
+                (.task // "") + "\n" +
+                (.bash // "") + "\n" +
+                (.script // "") + "\n" +
+                (.pwsh // "") + "\n" +
+                (.powershell // "") + "\n" +
+                (.inputs.script // "") + "\n" +
+                (.inputs.inlineScript // "") + "\n" +
+                (.inputs.arguments // "") + "\n" +
+                ((.inputs // {}) | tostring)
+              ) | ascii_downcase
+            )
+          | any(test($covRe) or test("publish coverity"))
+        ) as $hasCov
 
-def merge_vars(new):
-  if .variables == null then
-    .variables = new
-  elif (.variables | type) == "!!map" then
-    .variables = (.variables * new)
-  elif (.variables | type) == "!!seq" then
-    .variables += (new | to_entries | map({"name": .key, "value": .value}))
-  else
-    .
-  end;
+        # --- Detect if Black Duck already present ---
+        | (
+            (.steps // [])
+            | map(
+                (
+                  (.displayName // "") + " " +
+                  (.bash // .script // .pwsh // .powershell // "") + " " +
+                  (.inputs.script // .inputs.inlineScript // "") + " " +
+                  ((.inputs // {}) | tostring)
+                ) | ascii_downcase
+              )
+            | any(test($bdRe))
+          ) as $hasBD
 
-def delete_coverity_vars:
-  if .variables == null then
-    .
-  elif (.variables | type) == "!!map" then
-    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
-  elif (.variables | type) == "!!seq" then
-    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
-  else
-    .
-  end;
+        | if $hasCov then
 
-def inject_blackduck_preserving_position:
-  (.steps | to_entries | map(select(.value | is_coverity_any)) | .[0].key) as $firstIdx
-  | (if $firstIdx == null then . else
-      (.steps[0:$firstIdx]) as $prefix
-      | (.steps[$firstIdx:] | map(select(is_coverity_any | not))) as $suffix
-      | .steps = ($prefix + load(strenv(BD_STEPS)) + $suffix)
-    end);
+            # --- Delete COVERITY_ variables (map or seq) ---
+            (
+              if .variables == null then
+                .
+              elif (.variables | type) == "!!map" then
+                .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
+              elif (.variables | type) == "!!seq" then
+                .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
+              else
+                .
+              end
+            )
 
-# --- Apply transformation at the pipeline/root level (your YAML uses top-level steps) ---
-if (has("steps") and (.steps | type == "!!seq")) then
-  if (.steps | any(. | is_coverity_any)) then
-    delete_coverity_vars
-    | merge_vars(load(strenv(BD_VARS)))
-    | (if already_has_blackduck then
-         .steps |= map(select(is_coverity_any | not))
-       else
-         inject_blackduck_preserving_position
-       end)
-  else
-    .
-  end
-else
-  .
-end
+            # --- Merge in Black Duck vars (map or seq) ---
+            | (
+              if .variables == null then
+                .variables = $newVars
+              elif (.variables | type) == "!!map" then
+                .variables = (.variables * $newVars)
+              elif (.variables | type) == "!!seq" then
+                .variables += ($newVars | to_entries | map({"name": .key, "value": .value}))
+              else
+                .
+              end
+            )
+
+            # --- Remove Coverity steps (and optionally inject BD steps) ---
+            | (
+              # Find the index of the first Coverity-like step
+              (
+                (.steps // [])
+                | to_entries
+                | map(
+                    select(
+                      (
+                        (
+                          (.value.displayName // "") + "\n" +
+                          (.value.task // "") + "\n" +
+                          (.value.bash // "") + "\n" +
+                          (.value.script // "") + "\n" +
+                          (.value.pwsh // "") + "\n" +
+                          (.value.powershell // "") + "\n" +
+                          ((.value.inputs // {}) | tostring)
+                        ) | ascii_downcase
+                      )
+                      | test($covRe)
+                      or ((.value.displayName // "") | ascii_downcase | test("publish coverity"))
+                      or (((.value.inputs.pathToPublish // "") + " " + (.value.inputs.PathtoPublish // "")) | ascii_downcase | test("coverity|\\$\\(coverity_"))
+                      or (((.value.inputs.artifactName // "") + " " + (.value.inputs.ArtifactName // "")) | ascii_downcase | test("\\bcoverity\\b"))
+                    )
+                  )
+                | .[0].key
+              ) as $firstIdx
+
+              | if $hasBD then
+                  # If BD already exists: just remove Coverity-related steps everywhere
+                  .steps |= map(
+                    select(
+                      (
+                        (
+                          (.displayName // "") + "\n" +
+                          (.task // "") + "\n" +
+                          (.bash // "") + "\n" +
+                          (.script // "") + "\n" +
+                          (.pwsh // "") + "\n" +
+                          (.powershell // "") + "\n" +
+                          ((.inputs // {}) | tostring)
+                        ) | ascii_downcase
+                      )
+                      | test($covRe)
+                      or ((.displayName // "") | ascii_downcase | test("publish coverity"))
+                      or (((.inputs.pathToPublish // "") + " " + (.inputs.PathtoPublish // "")) | ascii_downcase | test("coverity|\\$\\(coverity_"))
+                      or (((.inputs.artifactName // "") + " " + (.inputs.ArtifactName // "")) | ascii_downcase | test("\\bcoverity\\b"))
+                      | not
+                    )
+                  )
+                else
+                  # Inject BD steps at first Coverity position; remove Coverity steps around it
+                  if $firstIdx == null then
+                    # No index found (unexpected since $hasCov true) — append BD steps
+                    .steps = (.steps + $newSteps)
+                  else
+                    (.steps[0:$firstIdx]) as $prefix
+                    | (
+                        .steps[$firstIdx:]
+                        | map(
+                            select(
+                              (
+                                (
+                                  (.displayName // "") + "\n" +
+                                  (.task // "") + "\n" +
+                                  (.bash // "") + "\n" +
+                                  (.script // "") + "\n" +
+                                  (.pwsh // "") + "\n" +
+                                  (.powershell // "") + "\n" +
+                                  ((.inputs // {}) | tostring)
+                                ) | ascii_downcase
+                              )
+                              | test($covRe)
+                              or ((.displayName // "") | ascii_downcase | test("publish coverity"))
+                              or (((.inputs.pathToPublish // "") + " " + (.inputs.PathtoPublish // "")) | ascii_downcase | test("coverity|\\$\\(coverity_"))
+                              or (((.inputs.artifactName // "") + " " + (.inputs.ArtifactName // "")) | ascii_downcase | test("\\bcoverity\\b"))
+                              | not
+                            )
+                          )
+                      ) as $suffix
+                    | .steps = ($prefix + $newSteps + $suffix)
+                  end
+              end
+            )
+
+          else
+            .
+          end
+
+      else
+        .
+      end
+  )
 YQ
-
+``
 # Execute yq transformation
-yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
+# Execute yq transformation (safe for eval-all: write to temp then move)
+TMP_OUT="$(mktemp)"
+yq eval-all -f "${YQ_PROG}" "${PIPELINE_FILE}" "${BD_VARS}" "${BD_STEPS}" > "${TMP_OUT}"
+mv "${TMP_OUT}" "${PIPELINE_FILE}"
 cat "${PIPELINE_FILE}"
 # Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
