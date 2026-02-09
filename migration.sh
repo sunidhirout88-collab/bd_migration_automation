@@ -20,7 +20,7 @@ echo "Updating: ${PIPELINE_FILE}"
 # Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# If older runs created multi-doc YAML (---), keep only the first doc. [3](https://github.com/mikefarah/yq/issues/1642)[4](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
+# Keep only first YAML document (protects against old eval-all multi-doc output). [3](https://github.com/mikefarah/yq/issues/1642)[4](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -77,35 +77,35 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program (matches YOUR Coverity format) ---
+# --- yq transformation program (FIELD-BASED + contains(), matches your YAML reliably) ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def s(x): (x // "" | tostring | ascii_downcase);
+def low(x): (x // "" | tostring | ascii_downcase);
 
-# Build a search blob from the fields where Coverity appears in your YAML:
-# - bash/script text includes cov-build etc
-# - displayName includes "Coverity ..."
-# - publish steps include artifactName/pathToPublish containing coverity or $(COVERITY_...)
-def step_blob:
+# Coverity step detection for your exact pipeline:
+# - bash/script contains cov-*
+# - displayName contains "coverity"
+# - publish inputs/artifactName include coverity
+def is_cov:
   (
-    s(.displayName) + "\n" +
-    s(.task) + "\n" +
-    s(.bash) + "\n" +
-    s(.script) + "\n" +
-    s(.pwsh) + "\n" +
-    s(.powershell) + "\n" +
-    s(.inputs.pathToPublish) + "\n" +
-    s(.inputs.PathtoPublish) + "\n" +
-    s(.inputs.artifactName) + "\n" +
-    s(.inputs.ArtifactName) + "\n" +
-    s((.inputs // {}) | tostring)
+    (low(.displayName) | contains("coverity"))
+    or (low(.bash) | contains("cov-"))
+    or (low(.script) | contains("cov-"))
+    or (low(.pwsh) | contains("cov-"))
+    or (low(.powershell) | contains("cov-"))
+    or (low(.inputs.pathToPublish) | contains("coverity"))
+    or (low(.inputs.PathtoPublish) | contains("coverity"))
+    or (low(.inputs.artifactName) | contains("coverity"))
+    or (low(.inputs.ArtifactName) | contains("coverity"))
   );
 
-def is_cov:
-  step_blob | test("\\bcov-\\b|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcoverity\\b|\\$\\(coverity_|\\$\\(coverity|\\$\\(coverity_|\\$\\(coverity");
-
+# Black Duck detection
 def is_bd:
-  step_blob | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url|blackduck\\.api\\.token");
+  (
+    (low(.displayName) | contains("black duck") or contains("synopsys detect"))
+    or (low(.bash) | contains("detect.sh") or contains("blackduck.url"))
+    or (low(.script) | contains("detect.sh") or contains("blackduck.url"))
+  );
 
 def delete_cov_vars:
   if .variables == null then
@@ -133,14 +133,14 @@ if (has("steps") and (.steps | type) == "!!seq") then
   (.steps) as $orig
   | ($orig | any(. | is_bd)) as $bdAlready
 
-  # Always remove COVERITY_* variables and Coverity steps
+  # Always remove Coverity vars + Coverity steps
   | delete_cov_vars
   | .steps = ($orig | map(select(is_cov | not)))
 
   # Always merge BD vars
   | merge_vars(load(strenv(BD_VARS)))
 
-  # Inject BD steps only if missing (insert after checkout if present)
+  # Inject BD steps only if missing: insert after first step (checkout), else append
   | (if $bdAlready then
        .
      else
@@ -155,7 +155,7 @@ else
 end
 YQ
 
-# Apply in-place edit (correct for single YAML file update). [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
+# Apply in-place edit (right pattern for single file). [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
 
 # Cleanup
@@ -165,9 +165,7 @@ echo "✅ Done. Updated ${PIPELINE_FILE}"
 echo "Backup saved as ${PIPELINE_FILE}.bak"
 
 echo "Post-check (ignore comments; should show NO real cov-* commands):"
-grep -nE '^[^#]*\bcov-build\b|^[^#]*\bcov-analyze\b|^[^#]*\bcov-format-errors\b|^[^#]*\bcov-commit-defects\b' -n "${PIPELINE_FILE}" \
-  || echo "✅ Coverity commands removed"
+grep -nE '^[^#]*\bcov-' -n "${PIPELINE_FILE}" || echo "✅ Coverity commands removed"
 
 echo "Post-check (should show Black Duck):"
-grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
-  || echo "✅ Black Duck present"
+grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" || echo "✅ Black Duck present"
