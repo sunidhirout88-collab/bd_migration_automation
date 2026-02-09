@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Resolve script path (works even after cd) ---
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+
+echo "SCRIPT PATH: ${SCRIPT_PATH}"
+echo "SCRIPT HASH: $(sha256sum "${SCRIPT_PATH}" | awk '{print $1}')"
+
 # --- Move to folder containing azure-pipelines.yml ---
-if [[ -f "azure-pipelines.yml" ]]; then
-  : # already here
-elif [[ -f "target/azure-pipelines.yml" ]]; then
-  cd target/
+# Repo has a cloned folder "target/" that contains the YAML
+if [[ -f "${SCRIPT_DIR}/target/azure-pipelines.yml" ]]; then
+  cd "${SCRIPT_DIR}/target"
+elif [[ -f "${SCRIPT_DIR}/azure-pipelines.yml" ]]; then
+  cd "${SCRIPT_DIR}"
 else
-  echo "ERROR: Cannot locate azure-pipelines.yml in current dir or ./target"
+  echo "ERROR: Cannot locate azure-pipelines.yml in ${SCRIPT_DIR} or ${SCRIPT_DIR}/target"
   exit 1
 fi
 
@@ -21,13 +29,11 @@ fi
 echo "Using yq: $(yq --version)"
 echo "PWD: $(pwd)"
 echo "Editing: ${PIPELINE_FILE}"
-echo "SCRIPT: $0"
-echo "SCRIPT HASH: $(sha256sum "$0" | awk '{print $1}')"
 
 # --- Backup ---
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Keep only first YAML document (guards against old eval-all multi-doc output). [3](https://github.com/mikefarah/yq/issues/1642)[4](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
+# Keep only the first YAML document (avoids leftover multi-doc output from eval-all runs) [2](https://github.com/mikefarah/yq/issues/1642)[3](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -84,15 +90,14 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program: remove Coverity + inject Black Duck if missing ---
+# --- yq program: EXACTLY matches your YAML structure ---
+# NOTE: We match Coverity using the actual fields where it appears:
+# - .bash contains cov-build/cov-analyze etc
+# - publish steps use artifactName/pathToPublish containing coverity
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
 def low(x): (x // "" | tostring | ascii_downcase);
 
-# This blob targets EXACTLY where Coverity appears in your YAML:
-# - bash/script bodies contain cov-*
-# - displayName contains "Coverity..."
-# - publish steps contain coverity in artifactName/pathToPublish
 def blob:
   (
     low(.displayName) + "\n" +
@@ -104,21 +109,14 @@ def blob:
     low(.inputs.pathToPublish) + "\n" +
     low(.inputs.PathtoPublish) + "\n" +
     low(.inputs.artifactName) + "\n" +
-    low(.inputs.ArtifactName) + "\n" +
-    low((.inputs // {}) | tostring)
+    low(.inputs.ArtifactName) + "\n"
   );
 
 def is_cov:
-  (blob | contains("cov-"))
-  or (blob | contains("coverity"))
-  or (blob | contains("$(coverity"))
-  or (blob | contains("$(coverity_"));
+  (blob | contains("cov-")) or (blob | contains("coverity"));
 
 def is_bd:
-  (blob | contains("detect.sh"))
-  or (blob | contains("blackduck.url"))
-  or (blob | contains("synopsys detect"))
-  or (blob | contains("black duck"));
+  (blob | contains("detect.sh")) or (blob | contains("synopsys detect")) or (blob | contains("blackduck.url")) or (blob | contains("black duck"));
 
 def delete_cov_vars:
   if .variables == null then
@@ -144,21 +142,18 @@ def merge_vars(new):
 
 if (has("steps") and (.steps | type) == "!!seq") then
   (.steps) as $orig
+  | ($orig | to_entries | map(select(.value | is_cov)) | map(.key)) as $covIdx
+  | ($orig | to_entries | map(select(.value | is_bd))  | map(.key)) as $bdIdx
   | ($orig | any(. | is_bd)) as $bdAlready
 
-  # 1) Remove COVERITY_* variables
+  # DEBUG: expose indices (printed if you run yq without -i; we’ll print via a separate command below)
   | delete_cov_vars
-
-  # 2) Remove all Coverity steps
   | .steps = ($orig | map(select(is_cov | not)))
-
-  # 3) Merge BD variables
   | merge_vars(load(strenv(BD_VARS)))
-
-  # 4) Inject BD steps only if missing: insert after step 0 (checkout), else append
   | (if $bdAlready then
        .
      else
+       # inject after checkout (step 0), else append
        if (.steps | length) > 0 then
          .steps = (.steps[0:1] + load(strenv(BD_STEPS)) + .steps[1:])
        else
@@ -170,36 +165,23 @@ else
 end
 YQ
 
-# --- Non-fatal debug counts (pre) ---
-echo "Coverity step count BEFORE:"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" \
-  || echo "DEBUG count failed (ignored)"
-
-echo "Black Duck step count BEFORE:"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\\.sh|blackduck\\.url|synopsys detect"))) | length' "${PIPELINE_FILE}" \
-  || echo "DEBUG count failed (ignored)"
+echo "Coverity step count BEFORE (bash contains cov-):"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
+echo "Black Duck step count BEFORE (bash contains detect.sh):"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | length' "${PIPELINE_FILE}" || true
 
 echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
-
-# In-place edit (recommended for single-file edits). [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
-yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
-
+yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"   # in-place single-file edit [1](https://github.com/mikefarah/yq/issues/1315)[4](https://linuxcommandlibrary.com/man/yq)
 echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
 
-# --- Non-fatal debug counts (post) ---
-echo "Coverity step count AFTER:"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" \
-  || echo "DEBUG count failed (ignored)"
+echo "Coverity step count AFTER (bash contains cov-):"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
+echo "Black Duck step count AFTER (bash contains detect.sh):"
+yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | length' "${PIPELINE_FILE}" || true
 
-echo "Black Duck step count AFTER:"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\\.sh|blackduck\\.url|synopsys detect"))) | length' "${PIPELINE_FILE}" \
-  || echo "DEBUG count failed (ignored)"
-
-# Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 
 echo "✅ Done. Updated ${PIPELINE_FILE}"
-cat "${PIPELINE_FILE}"
 echo "Backup saved as ${PIPELINE_FILE}.bak"
 
 echo "Post-check (ignore comments; should show NO real cov-* commands):"
