@@ -21,6 +21,9 @@ fi
 echo "Using yq: $(yq --version)"
 echo "Updating: ${PIPELINE_FILE}"
 
+yq e 'has("steps")' azure-pipelines.yml
+yq e '.steps | type' azure-pipelines.yml
+
 # --- Backup ---
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
@@ -187,7 +190,6 @@ echo "Backup saved as ${PIPELINE_FILE}.bak"
 
 ls -la
 cat azure-pipelines.yml
-yq e '...the summary command in section #2...' azure-pipelines.yml
 grep -nE '&gt;|&lt;|&amp;' your-script.sh || echo "✅ no html escapes"
 echo "Post-check (should show NO cov-*):"
 grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -n "${PIPELINE_FILE}" || echo "✅ Coverity removed"
