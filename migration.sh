@@ -234,3 +234,22 @@ else
   exit 1
 fi
 cat "${PIPELINE_FILE}"
+git config user.email "pipeline-bot@example.com"
+git config user.name  "pipeline-bot"
+
+git add -A
+
+# Commit (if nothing staged, don't fail)
+git commit -m "$COMMIT_MESSAGE" || true
+
+# Push using HTTP header auth (avoid putting token in the URL / printing it)
+# Azure DevOps guidance: avoid exposing secrets in logs/command line; use secret vars/env. [3](https://www.geeksforgeeks.org/python/how-to-define-and-call-a-function-in-python/)
+# GitHub requires token-based auth for HTTPS pushes. [4](https://thebottleneckdev.com/blog/processing-yaml-files)
+AUTH_B64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+
+# Disable xtrace during push to reduce accidental leakage
+set +x
+git -c http.extraheader="AUTHORIZATION: basic ${AUTH_B64}" push origin "HEAD:${TARGET_BRANCH}"
+set -x
+
+echo "Push completed to branch: ${TARGET_BRANCH}"
