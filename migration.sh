@@ -24,6 +24,43 @@ echo "Updating: ${PIPELINE_FILE}"
 yq e 'has("steps")' azure-pipelines.yml
 yq e '.steps | type' azure-pipelines.yml
 
+yq e '
+def step_text:
+  (
+    (.displayName // "") + "\n" +
+    (.task // "") + "\n" +
+    (.bash // "") + "\n" +
+    (.script // "") + "\n" +
+    (.pwsh // "") + "\n" +
+    (.powershell // "") + "\n" +
+    (.inputs.script // "") + "\n" +
+    (.inputs.inlineScript // "") + "\n" +
+    (.inputs.arguments // "") + "\n" +
+    (.inputs | tostring)
+  ) | ascii_downcase;
+
+def is_coverity_step:
+  step_text
+  | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b");
+
+def is_coverity_publish:
+  (
+    ((.displayName // "") | ascii_downcase | test("publish coverity"))
+    or ((.inputs.pathToPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
+    or ((.inputs.PathtoPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
+    or ((.inputs.artifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
+    or ((.inputs.ArtifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
+  );
+
+def is_coverity_any:
+  is_coverity_step or is_coverity_publish;
+
+{
+  coverity_indices: ((.steps // []) | to_entries | map(select(.value | is_coverity_any)) | map(.key)),
+  coverity_count: ((.steps // []) | to_entries | map(select(.value | is_coverity_any)) | length)
+}
+' azure-pipelines.yml
+
 # --- Backup ---
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
