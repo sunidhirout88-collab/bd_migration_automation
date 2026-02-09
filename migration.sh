@@ -283,3 +283,6 @@ grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -
 
 echo "Post-check (should show Black Duck):"
 grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" || echo "❌ Black Duck not found (unexpected)"
+
+grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -n azure-pipelines.yml || echo "✅ Coverity removed"
+grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n azure-pipelines.yml || echo "✅ Black Duck present"
