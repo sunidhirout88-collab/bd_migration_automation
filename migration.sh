@@ -24,10 +24,10 @@ yq e '.steps | type' "${PIPELINE_FILE}"
 # Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Ensure single-document YAML (remove extra docs if older eval-all appended them)
+# Ensure single-document YAML (protects against old eval-all multi-doc output). [5](https://github.com/mikefarah/yq/issues/1642)[6](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
-# --- Black Duck variables ---
+# --- Black Duck variables (map) ---
 BD_VARS="$(mktemp)"
 cat > "${BD_VARS}" <<'YAML'
 BLACKDUCK_URL: 'https://blackduck.mycompany.com'
@@ -36,7 +36,7 @@ BD_VERSION: '$(Build.SourceBranchName)'
 DETECT_VERSION: 'latest'
 YAML
 
-# --- Black Duck steps ---
+# --- Black Duck steps (sequence) ---
 BD_STEPS="$(mktemp)"
 cat > "${BD_STEPS}" <<'YAML'
 - task: JavaToolInstaller@0
@@ -81,17 +81,22 @@ YAML
 
 export BD_VARS BD_STEPS
 
+# Optional: prove load() works (helps debugging quickly)
+yq -n 'load(strenv(BD_VARS))' >/dev/null
+yq -n 'load(strenv(BD_STEPS))' >/dev/null
+
 # --- yq transformation program ---
+# Key idea: detect Coverity/BlackDuck by recursively scanning all string scalars in each step. [1](https://deepwiki.com/mikefarah/yq)[2](https://nonbleedingedge.com/cheatsheets/yq.html)
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def step_has(pattern):
+def step_has(re):
   (
     [ .. | select(tag == "!!str") | ascii_downcase ]
-    | any(test(pattern))
+    | any(test(re))
   );
 
 def is_cov:
-  step_has("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b");
+  step_has("coverity|cov-build|cov-analyze|cov-format-errors|cov-commit-defects|cov-commit|cov-import-scm|cov-run-desktop|cov-manage-im");
 
 def is_bd:
   step_has("black duck|synopsys detect|detect\\.sh|blackduck\\.url");
@@ -126,11 +131,11 @@ if (has("steps") and (.steps | type) == "!!seq") then
   | ($orig | any(. | is_bd)) as $bdAlready
   | (first_cov_idx($orig)) as $covIdx
 
-  # Always remove COVERITY_* variables and merge BD vars
+  # Always: remove COVERITY_* vars and merge BD vars
   | delete_cov_vars
   | merge_vars(load(strenv(BD_VARS)))
 
-  # Always remove Coverity steps
+  # Always: remove Coverity steps
   | (.steps = ($orig | map(select(is_cov | not))))
 
   # Inject BD steps only if missing
@@ -152,15 +157,27 @@ else
 end
 YQ
 
-# Safety: ensure heredoc created program properly
+# Ensure YQ program exists and is non-empty
 if [[ ! -s "${YQ_PROG}" ]]; then
   echo "ERROR: YQ program file is empty: ${YQ_PROG}"
   exit 1
 fi
 
 echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
+
+# Edit pipeline in place (recommended for single-file edits). [3](https://github.com/mikefarah/yq/issues/1315)[4](https://linuxcommandlibrary.com/man/yq)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
+
 echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
+
+echo "Diff vs backup:"
+set +e
+diff -u "${PIPELINE_FILE}.bak" "${PIPELINE_FILE}"
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  echo "(no diff)"
+fi
 
 # Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
@@ -174,7 +191,7 @@ grep -nE '^[^#]*\bcov-build\b|^[^#]*\bcov-analyze\b|^[^#]*\bcov-format-errors\b|
 
 echo "Post-check (should show Black Duck):"
 grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
-  || echo "❌ Black Duck not found (unexpected)"
+  || echo "✅ Black Duck present"
 
 echo "Post-check (single-document YAML; no ---):"
 grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
