@@ -183,6 +183,7 @@ rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 
 echo "✅ Done. Updated ${PIPELINE_FILE}"
 echo "Backup saved as ${PIPELINE_FILE}.bak"
+cat "${PIPELINE_FILE}"
 
 echo "Post-check (ignore comments; should show NO real cov-* commands):"
 grep -nE "^[^#]*\\bcov-build\\b|^[^#]*\\bcov-analyze\\b|^[^#]*\\bcov-format-errors\\b|^[^#]*\\bcov-commit-defects\\b" -n "${PIPELINE_FILE}" \
