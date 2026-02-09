@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------- Resolve script path safely ----------
+# ---------- Resolve script location safely ----------
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 
@@ -19,189 +19,209 @@ else
 fi
 
 PIPELINE_FILE="azure-pipelines.yml"
-
-# ---------- Prereqs ----------
-if ! command -v yq >/dev/null 2>&1; then
-  echo "ERROR: yq (Mike Farah, v4+) is required."
-  exit 1
-fi
-
-echo "Using yq: $(yq --version)"
 echo "PWD: $(pwd)"
 echo "Editing: ${PIPELINE_FILE}"
 
-# ---------- Backup ----------
-cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
-
-# Keep only the first YAML document (guards against multi-doc leftovers)
-yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
-
-# ---------- Black Duck variables (map) ----------
-BD_VARS="$(mktemp)"
-cat > "${BD_VARS}" <<'YAML'
-BLACKDUCK_URL: 'https://blackduck.mycompany.com'
-BD_PROJECT: 'my-app'
-BD_VERSION: '$(Build.SourceBranchName)'
-DETECT_VERSION: 'latest'
-YAML
-
-# ---------- Black Duck steps (sequence) ----------
-BD_STEPS="$(mktemp)"
-cat > "${BD_STEPS}" <<'YAML'
-- task: JavaToolInstaller@0
-  displayName: "Use Java 11"
-  inputs:
-    versionSpec: '11'
-    jdkArchitectureOption: 'x64'
-    jdkSourceOption: 'PreInstalled'
-
-- bash: |
-    set -euo pipefail
-    echo "Downloading Synopsys Detect..."
-    curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh
-    chmod +x detect.sh
-
-    echo "Running Black Duck scan via Synopsys Detect..."
-    ./detect.sh \
-      --blackduck.url="$(BLACKDUCK_URL)" \
-      --blackduck.api.token="$(BLACKDUCK_API_TOKEN)" \
-      --detect.project.name="$(BD_PROJECT)" \
-      --detect.project.version.name="$(BD_VERSION)" \
-      --detect.source.path="$(Build.SourcesDirectory)" \
-      --detect.tools=DETECTOR,SIGNATURE_SCAN \
-      --detect.detector.search.depth=6 \
-      --detect.wait.for.results=true \
-      --detect.notices.report=true \
-      --detect.risk.report.pdf=true \
-      --logging.level.com.synopsys.integration=INFO \
-      --detect.cleanup=true
-  displayName: "Black Duck Scan (Synopsys Detect)"
-  env:
-    BLACKDUCK_API_TOKEN: $(BLACKDUCK_API_TOKEN)
-
-- task: PublishBuildArtifacts@1
-  displayName: "Publish Black Duck Reports"
-  inputs:
-    PathtoPublish: "$(Build.SourcesDirectory)/blackduck"
-    ArtifactName: "blackduck-reports"
-  condition: succeededOrFailed()
-YAML
-
-export BD_VARS BD_STEPS
-
-# ---------- Debug counts BEFORE (non-fatal) ----------
-echo "Coverity bash-step count BEFORE (cov- in .bash):"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
-
-echo "BlackDuck detect-step count BEFORE (detect.sh in .bash):"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | length' "${PIPELINE_FILE}" || true
-
-echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
-
-# ---------- yq program (NO '#' comments inside this block) ----------
-YQ_PROG="$(mktemp)"
-cat > "${YQ_PROG}" <<'YQ'
-def low(x): (x // "" | tostring | ascii_downcase);
-
-def is_cov_step:
-  (
-    (low(.displayName) | contains("coverity"))
-    or (low(.bash) | contains("cov-"))
-    or (low(.script) | contains("cov-"))
-    or (low(.pwsh) | contains("cov-"))
-    or (low(.powershell) | contains("cov-"))
-    or (low(.inputs.artifactName) | contains("coverity"))
-    or (low(.inputs.ArtifactName) | contains("coverity"))
-    or (low(.inputs.pathToPublish) | contains("coverity") or contains("$(coverity") or contains("$(coverity_")))
-    or (low(.inputs.PathtoPublish) | contains("coverity") or contains("$(coverity") or contains("$(coverity_")))
-  );
-
-def has_bd_steps:
-  (.steps // [])
-  | any(
-      (low(.displayName) | contains("black duck") or contains("synopsys detect"))
-      or (low(.bash) | contains("detect.sh") or contains("blackduck.url"))
-      or (low(.script) | contains("detect.sh") or contains("blackduck.url"))
-    );
-
-def delete_cov_vars:
-  if .variables == null then
-    .
-  elif (.variables | type) == "!!map" then
-    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
-  elif (.variables | type) == "!!seq" then
-    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
-  else
-    .
-  end;
-
-def merge_vars(new):
-  if .variables == null then
-    .variables = new
-  elif (.variables | type) == "!!map" then
-    .variables = (.variables * new)
-  elif (.variables | type) == "!!seq" then
-    .variables += (new | to_entries | map({"name": .key, "value": .value}))
-  else
-    .
-  end;
-
-if (has("steps") and (.steps | type) == "!!seq") then
-  delete_cov_vars
-  | .steps |= map(select(is_cov_step | not))
-  | merge_vars(load(strenv(BD_VARS)))
-  | (if has_bd_steps then
-       .
-     else
-       if (.steps | length) > 0 then
-         .steps = (.steps[0:1] + load(strenv(BD_STEPS)) + .steps[1:])
-       else
-         .steps = load(strenv(BD_STEPS))
-       end
-     end)
-else
-  .
-end
-YQ
-
-# ---------- ADDITION: Debug block around yq eval (this is what you asked for) ----------
-echo "=== DEBUG: yq program file ==="
-wc -l "$YQ_PROG"
-sed -n '1,160p' "$YQ_PROG"
-
-echo "=== DEBUG: running yq eval now ==="
-set -x
-yq eval -i -f "$YQ_PROG" "$PIPELINE_FILE" 2>yq_error.log || {
-  set +x
-  echo "❌ yq eval failed. Error output:"
-  cat yq_error.log
-  echo "=== DEBUG: yq program (full) ==="
-  cat "$YQ_PROG"
-  echo "=== DEBUG: pipeline excerpt (first 120 lines) ==="
-  sed -n '1,120p' "$PIPELINE_FILE"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required on the agent."
   exit 1
-}
-set +x
+fi
 
-echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
-
-# ---------- Debug counts AFTER (non-fatal) ----------
-echo "Coverity bash-step count AFTER (cov- in .bash):"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
-
-echo "BlackDuck detect-step count AFTER (detect.sh in .bash):"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | length' "${PIPELINE_FILE}" || true
-
-# ---------- Cleanup ----------
-rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}" yq_error.log
-
-echo "✅ Done. Updated ${PIPELINE_FILE}"
+# Backup
+cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 echo "Backup saved as ${PIPELINE_FILE}.bak"
 
-# ---------- Post-checks (accurate) ----------
+# Install ruamel.yaml (preserves comments/format much better than plain PyYAML)
+python3 -m pip -q install --user ruamel.yaml >/dev/null 2>&1 || {
+  echo "ERROR: failed to install ruamel.yaml (pip)."
+  exit 1
+}
+
+python3 - <<'PY'
+import re
+from copy import deepcopy
+from ruamel.yaml import YAML
+
+PIPELINE_FILE = "azure-pipelines.yml"
+
+COV_RE = re.compile(r"\bcov-", re.IGNORECASE)
+COVERITY_RE = re.compile(r"\bcoverity\b", re.IGNORECASE)
+BD_RE = re.compile(r"(synopsys detect|detect\.sh|blackduck\.url|black duck)", re.IGNORECASE)
+
+BD_VARS = {
+    "BLACKDUCK_URL": "https://blackduck.mycompany.com",
+    "BD_PROJECT": "my-app",
+    "BD_VERSION": "$(Build.SourceBranchName)",
+    "DETECT_VERSION": "latest",
+}
+
+BD_STEPS = [
+    {
+        "task": "JavaToolInstaller@0",
+        "displayName": "Use Java 11",
+        "inputs": {
+            "versionSpec": "11",
+            "jdkArchitectureOption": "x64",
+            "jdkSourceOption": "PreInstalled",
+        },
+    },
+    {
+        "bash": "\n".join([
+            "set -euo pipefail",
+            "",
+            'echo "Downloading Synopsys Detect..."',
+            "curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh",
+            "chmod +x detect.sh",
+            "",
+            'echo "Running Black Duck scan via Synopsys Detect..."',
+            "./detect.sh \\",
+            '  --blackduck.url="$(BLACKDUCK_URL)" \\',
+            '  --blackduck.api.token="$(BLACKDUCK_API_TOKEN)" \\',
+            '  --detect.project.name="$(BD_PROJECT)" \\',
+            '  --detect.project.version.name="$(BD_VERSION)" \\',
+            '  --detect.source.path="$(Build.SourcesDirectory)" \\',
+            "  --detect.tools=DETECTOR,SIGNATURE_SCAN \\",
+            "  --detect.detector.search.depth=6 \\",
+            "  --detect.wait.for.results=true \\",
+            "  --detect.notices.report=true \\",
+            "  --detect.risk.report.pdf=true \\",
+            "  --logging.level.com.synopsys.integration=INFO \\",
+            "  --detect.cleanup=true",
+        ]),
+        "displayName": "Black Duck Scan (Synopsys Detect)",
+        "env": {"BLACKDUCK_API_TOKEN": "$(BLACKDUCK_API_TOKEN)"},
+    },
+    {
+        "task": "PublishBuildArtifacts@1",
+        "displayName": "Publish Black Duck Reports",
+        "inputs": {
+            "PathtoPublish": "$(Build.SourcesDirectory)/blackduck",
+            "ArtifactName": "blackduck-reports",
+        },
+        "condition": "succeededOrFailed()",
+    },
+]
+
+def step_text(step):
+    if not isinstance(step, dict):
+        return ""
+    parts = []
+    for k in ("displayName","task","bash","script","pwsh","powershell"):
+        v = step.get(k)
+        if isinstance(v, str):
+            parts.append(v)
+    inputs = step.get("inputs", {})
+    if isinstance(inputs, dict):
+        for k, v in inputs.items():
+            parts.append(f"{k}={v}")
+    return "\n".join(parts).lower()
+
+def is_coverity_step(step):
+    t = step_text(step)
+    if COV_RE.search(t) or COVERITY_RE.search(t):
+        return True
+    inputs = step.get("inputs", {}) if isinstance(step, dict) else {}
+    if isinstance(inputs, dict):
+        art = str(inputs.get("artifactName", inputs.get("ArtifactName",""))).lower()
+        pth = str(inputs.get("pathToPublish", inputs.get("PathtoPublish",""))).lower()
+        if "coverity" in art or "coverity" in pth or "$(coverity_" in pth:
+            return True
+    return False
+
+def has_blackduck(pipeline):
+    return any(BD_RE.search(step_text(s)) for s in (pipeline.get("steps") or []))
+
+def coverity_bash_count(pipeline):
+    c = 0
+    for s in pipeline.get("steps") or []:
+        if isinstance(s, dict) and isinstance(s.get("bash"), str) and COV_RE.search(s["bash"]):
+            c += 1
+    return c
+
+def detect_bash_count(pipeline):
+    c = 0
+    for s in pipeline.get("steps") or []:
+        if isinstance(s, dict) and isinstance(s.get("bash"), str) and re.search(r"detect\.sh", s["bash"], re.I):
+            c += 1
+    return c
+
+def drop_coverity_vars(vars_node):
+    if vars_node is None:
+        return None
+    if isinstance(vars_node, dict):
+        return {k:v for k,v in vars_node.items() if not str(k).startswith("COVERITY_")}
+    if isinstance(vars_node, list):
+        out=[]
+        for item in vars_node:
+            if isinstance(item, dict) and str(item.get("name","")).startswith("COVERITY_"):
+                continue
+            out.append(item)
+        return out
+    return vars_node
+
+def merge_bd_vars(vars_node):
+    if vars_node is None:
+        return deepcopy(BD_VARS)
+    if isinstance(vars_node, dict):
+        merged = dict(vars_node)
+        merged.update(BD_VARS)
+        return merged
+    if isinstance(vars_node, list):
+        out = list(vars_node)
+        existing = {i.get("name") for i in out if isinstance(i, dict)}
+        for k,v in BD_VARS.items():
+            if k not in existing:
+                out.append({"name": k, "value": v})
+        return out
+    return vars_node
+
+def inject_bd_steps(steps):
+    steps = steps or []
+    # insert after first step (usually checkout)
+    if len(steps) >= 1:
+        return [steps[0]] + deepcopy(BD_STEPS) + steps[1:]
+    return deepcopy(BD_STEPS)
+
+yaml = YAML()
+yaml.preserve_quotes = True
+yaml.indent(mapping=2, sequence=2, offset=0)
+
+with open(PIPELINE_FILE, "r", encoding="utf-8") as f:
+    pipeline = yaml.load(f)
+
+if not isinstance(pipeline, dict):
+    raise SystemExit("ERROR: pipeline root is not a YAML map/object.")
+
+print("Coverity bash-step count BEFORE:", coverity_bash_count(pipeline))
+print("Detect bash-step count BEFORE:", detect_bash_count(pipeline))
+
+# variables: remove coverity + merge BD
+pipeline["variables"] = merge_bd_vars(drop_coverity_vars(pipeline.get("variables")))
+
+# steps: remove coverity
+steps = pipeline.get("steps") or []
+if not isinstance(steps, list):
+    steps = []
+steps = [s for s in steps if not (isinstance(s, dict) and is_coverity_step(s))]
+pipeline["steps"] = steps
+
+# inject BD steps if missing
+if not has_blackduck(pipeline):
+    pipeline["steps"] = inject_bd_steps(pipeline["steps"])
+
+print("Coverity bash-step count AFTER:", coverity_bash_count(pipeline))
+print("Detect bash-step count AFTER:", detect_bash_count(pipeline))
+
+with open(PIPELINE_FILE, "w", encoding="utf-8") as f:
+    yaml.dump(pipeline, f)
+
+print("✅ Migration complete:", PIPELINE_FILE)
+PY
+
 echo "Post-check Coverity (should be EMPTY):"
 if grep -nE '^[^#]*\bcov-' -n "${PIPELINE_FILE}"; then
   echo "❌ Coverity still present"
+  exit 1
 else
   echo "✅ Coverity removed"
 fi
@@ -211,4 +231,5 @@ if grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}"; 
   echo "✅ Black Duck present"
 else
   echo "❌ Black Duck NOT found"
+  exit 1
 fi
