@@ -233,3 +233,4 @@ else
   echo "❌ Black Duck NOT found"
   exit 1
 fi
+cat "${PIPELINE_FILE}"
