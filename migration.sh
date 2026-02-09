@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve script location safely
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 
@@ -32,7 +31,7 @@ echo "Editing: ${PIPELINE_FILE}"
 # Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Keep only first YAML document (protect against old eval-all multi-doc output) [2](https://github.com/mikefarah/yq/issues/1642)[3](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
+# Keep only first YAML doc (prevents multi-doc leftovers) [3](https://github.com/mikefarah/yq/issues/1642)[4](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
@@ -59,7 +58,6 @@ cat > "${BD_STEPS}" <<'YAML'
     echo "Downloading Synopsys Detect..."
     curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh
     chmod +x detect.sh
-
     echo "Running Black Duck scan via Synopsys Detect..."
     ./detect.sh \
       --blackduck.url="$(BLACKDUCK_URL)" \
@@ -88,7 +86,7 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- Debug BEFORE ---
+# Debug BEFORE (non-fatal)
 echo "Coverity bash-step count BEFORE (cov- in .bash):"
 yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
 echo "BlackDuck detect-step count BEFORE (detect.sh in .bash):"
@@ -96,91 +94,3 @@ yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | len
 
 echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
 
-# -------------------------------------------------------------------
-# 1) REMOVE COVERITY: variables + steps (single deterministic yq edit)
-# -------------------------------------------------------------------
-yq e -i '
-  # Drop COVERITY_* variables (handles map or seq)
-  (if .variables == null then .
-   elif (.variables | type) == "!!map" then
-     .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
-   elif (.variables | type) == "!!seq" then
-     .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
-   else .
-   end)
-  |
-  # Drop Coverity steps:
-  # - any bash/script/pwsh/powershell containing cov-
-  # - any displayName/task containing coverity
-  # - any publish step with coverity artifact/path
-  (.steps |= map(
-    select(
-      (
-        ((.bash // "") + " " + (.script // "") + " " + (.pwsh // "") + " " + (.powershell // "")) | test("(?i)cov-")
-      )
-      or (
-        ((.displayName // "") + " " + (.task // "")) | test("(?i)coverity")
-      )
-      or (
-        ((.inputs.artifactName // "") + " " + (.inputs.ArtifactName // "")) | test("(?i)coverity")
-      )
-      or (
-        ((.inputs.pathToPublish // "") + " " + (.inputs.PathtoPublish // "")) | test("(?i)coverity|\\$\\(coverity_")
-      )
-      | not
-    )
-  ))
-' "${PIPELINE_FILE}"
-
-# -------------------------------------------------------------------
-# 2) MERGE BD VARS (safe map merge; your variables are a map)
-# -------------------------------------------------------------------
-yq e -i '
-  .variables = ((.variables // {}) * load(strenv(BD_VARS)))
-' "${PIPELINE_FILE}"
-
-# -------------------------------------------------------------------
-# 3) INJECT BD STEPS if detect.sh not present
-#    Insert right after first step (checkout) if steps exist.
-# -------------------------------------------------------------------
-yq e -i '
-  if (.steps // [] | any((.bash // "") | test("(?i)detect\\.sh"))) then
-    .
-  else
-    .steps = (
-      if (.steps | length) > 0 then
-        .steps[0:1] + load(strenv(BD_STEPS)) + .steps[1:]
-      else
-        load(strenv(BD_STEPS))
-      end
-    )
-  end
-' "${PIPELINE_FILE}"
-
-echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
-
-# --- Debug AFTER ---
-echo "Coverity bash-step count AFTER (cov- in .bash):"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
-echo "BlackDuck detect-step count AFTER (detect.sh in .bash):"
-yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | length' "${PIPELINE_FILE}" || true
-
-# Cleanup temp files
-rm -f "${BD_VARS}" "${BD_STEPS}"
-
-echo "✅ Done. Updated ${PIPELINE_FILE}"
-echo "Backup saved as ${PIPELINE_FILE}.bak"
-
-echo "Post-check Coverity (should be EMPTY):"
-if grep -nE '^[^#]*\bcov-' -n "${PIPELINE_FILE}"; then
-  echo "❌ Coverity still present"
-else
-  echo "✅ Coverity removed"
-fi
-
-echo "Post-check Black Duck (should show detect.sh or Black Duck Scan):"
-if grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}"; then
-  echo "✅ Black Duck present"
-else
-  echo "❌ Black Duck NOT found"
-fi
