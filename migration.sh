@@ -2,6 +2,8 @@
 set -euo pipefail
 
 PIPELINE_FILE="azure-pipelines.yml"
+
+# YAML is inside target/
 cd target/
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
@@ -17,14 +19,17 @@ fi
 echo "Using yq: $(yq --version)"
 echo "Updating: ${PIPELINE_FILE}"
 
+# Sanity checks
 yq e 'has("steps")' "${PIPELINE_FILE}"
 yq e '.steps | type' "${PIPELINE_FILE}"
 
+# Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Clean up multi-document YAML created by older eval-all runs (keep only doc 0)
+# If prior runs created multi-document YAML (---), keep only the first document
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
+# --- Black Duck variables (map) ---
 BD_VARS="$(mktemp)"
 cat > "${BD_VARS}" <<'YAML'
 BLACKDUCK_URL: 'https://blackduck.mycompany.com'
@@ -33,6 +38,7 @@ BD_VERSION: '$(Build.SourceBranchName)'
 DETECT_VERSION: 'latest'
 YAML
 
+# --- Black Duck steps (sequence) ---
 BD_STEPS="$(mktemp)"
 cat > "${BD_STEPS}" <<'YAML'
 - task: JavaToolInstaller@0
@@ -44,6 +50,7 @@ cat > "${BD_STEPS}" <<'YAML'
 
 - bash: |
     set -euo pipefail
+
     echo "Downloading Synopsys Detect..."
     curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh
     chmod +x detect.sh
@@ -76,21 +83,49 @@ YAML
 
 export BD_VARS BD_STEPS
 
+# --- yq program file (robust matching using explicit step text) ---
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
-def is_cov: (tostring | ascii_downcase | test("coverity|\\bcov-"));
-def is_bd:  (tostring | ascii_downcase | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"));
+def step_text:
+  (
+    (.displayName // "") + "\n" +
+    (.task // "") + "\n" +
+    (.bash // "") + "\n" +
+    (.script // "") + "\n" +
+    (.pwsh // "") + "\n" +
+    (.powershell // "") + "\n" +
+    (.inputs.script // "") + "\n" +
+    (.inputs.inlineScript // "") + "\n" +
+    (.inputs.arguments // "") + "\n" +
+    ((.inputs // {}) | tostring)
+  ) | ascii_downcase;
 
-def delete_coverity_vars:
-  if .variables == null then
-    .
-  elif (.variables | type) == "!!map" then
-    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
-  elif (.variables | type) == "!!seq" then
-    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
-  else
-    .
-  end;
+def is_coverity_any:
+  (
+    step_text
+    | test("coverity|\\bcov-build\\b|\\bcov-analyze\\b|\\bcov-format-errors\\b|\\bcov-commit-defects\\b|\\bcov-commit\\b|\\bcov-import-scm\\b|\\bcov-run-desktop\\b|\\bcov-manage-im\\b")
+  )
+  or (
+    ((.displayName // "") | ascii_downcase | test("publish coverity"))
+    or ((.inputs.pathToPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
+    or ((.inputs.PathtoPublish // "") | ascii_downcase | test("coverity|\\$\\(coverity_"))
+    or ((.inputs.artifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
+    or ((.inputs.ArtifactName // "") | ascii_downcase | test("\\bcoverity\\b"))
+  );
+
+def already_has_blackduck:
+  (
+    (.steps // [])
+    | map(
+        (
+          (.displayName // "") + " " +
+          (.bash // .script // .pwsh // .powershell // "") + " " +
+          (.inputs.script // .inputs.inlineScript // "") + " " +
+          ((.inputs // {}) | tostring)
+        ) | ascii_downcase
+      )
+    | any(test("black duck|synopsys detect|detect\\.sh|blackduck\\.url"))
+  );
 
 def merge_vars(new):
   if .variables == null then
@@ -103,30 +138,37 @@ def merge_vars(new):
     .
   end;
 
-def first_cov_idx:
-  (.steps | to_entries | map(select(.value | is_cov)) | .[0].key);
+def delete_coverity_vars:
+  if .variables == null then
+    .
+  elif (.variables | type) == "!!map" then
+    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
+  elif (.variables | type) == "!!seq" then
+    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
+  else
+    .
+  end;
 
-def remove_cov_steps:
-  .steps |= map(select((. | is_cov) | not));
-
-def inject_bd_at_first_cov:
-  (first_cov_idx) as $i
-  | if $i == null then
+def inject_blackduck_preserving_position:
+  (.steps | to_entries | map(select(.value | is_coverity_any)) | .[0].key) as $firstIdx
+  | (if $firstIdx == null then
+      # If no index found, append BD steps
       .steps = (.steps + load(strenv(BD_STEPS)))
     else
-      (.steps[0:$i]) as $prefix
-      | (.steps[$i:] | map(select((. | is_cov) | not))) as $suffix
+      (.steps[0:$firstIdx]) as $prefix
+      | (.steps[$firstIdx:] | map(select(is_coverity_any | not))) as $suffix
       | .steps = ($prefix + load(strenv(BD_STEPS)) + $suffix)
-    end;
+    end);
 
-if (has("steps") and (.steps | type) == "!!seq") then
-  if (.steps | any(. | is_cov)) then
+if (has("steps") and (.steps | type == "!!seq")) then
+  if (.steps | any(. | is_coverity_any)) then
     delete_coverity_vars
     | merge_vars(load(strenv(BD_VARS)))
-    | (if (.steps | any(. | is_bd)) then
-         remove_cov_steps
+    | (if already_has_blackduck then
+         # BD already exists: only remove coverity
+         .steps |= map(select(is_coverity_any | not))
        else
-         inject_bd_at_first_cov
+         inject_blackduck_preserving_position
        end)
   else
     .
@@ -136,16 +178,10 @@ else
 end
 YQ
 
-# Non-fatal debug
-echo "Debug detection counts (before edit):"
-yq e '{
-  "cov_steps": ((.steps // []) | map(select(((tostring | ascii_downcase) | test("coverity|\\bcov-")))) | length),
-  "bd_steps":  ((.steps // []) | map(select(((tostring | ascii_downcase) | test("black duck|synopsys detect|detect\\.sh|blackduck\\.url")))) | length)
-}' "${PIPELINE_FILE}" || echo "Debug detection skipped (non-fatal)"
-
-# ✅ Correct: edit ONLY the pipeline file in place (avoid eval-all multi-doc output)
+# ✅ Apply transformation (single-file in-place edit)
 yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
 
+# Cleanup
 rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
 
 echo "✅ Done. Updated ${PIPELINE_FILE}"
@@ -157,7 +193,7 @@ grep -nE "cov-build|cov-analyze|cov-format-errors|cov-commit-defects|Coverity" -
 
 echo "Post-check (should show Black Duck):"
 grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
-  || echo "❌ Black Duck not found (unexpected)"
+  || echo "✅ Black Duck present"
 
 echo "Post-check (should be single-document YAML; no ---):"
 grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
