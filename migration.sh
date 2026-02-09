@@ -32,8 +32,8 @@ echo "Editing: ${PIPELINE_FILE}"
 # Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# Keep only first document (prevents multi-doc leftovers from earlier eval-all usage)
-yq e -i 'select(di == 0)' "${PIPELINE_FILE}"  # eval-all can emit multi-docs unless selecting one [3](https://github.com/mikefarah/yq/issues/1642)[4](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
+# Keep only first YAML document (protect against old eval-all multi-doc output) [2](https://github.com/mikefarah/yq/issues/1642)[3](https://unix.stackexchange.com/questions/561460/how-to-print-path-and-key-values-of-json-file)
+yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
 # --- Black Duck variables (map) ---
 BD_VARS="$(mktemp)"
@@ -56,7 +56,6 @@ cat > "${BD_STEPS}" <<'YAML'
 
 - bash: |
     set -euo pipefail
-
     echo "Downloading Synopsys Detect..."
     curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh
     chmod +x detect.sh
@@ -89,100 +88,85 @@ YAML
 
 export BD_VARS BD_STEPS
 
-# --- yq program: deterministic removal/injection for your pipeline structure ---
-YQ_PROG="$(mktemp)"
-cat > "${YQ_PROG}" <<'YQ'
-def low(x): (x // "" | tostring | ascii_downcase);
-
-# Coverity appears in:
-# - bash/script bodies (cov-*)
-# - displayName ("Coverity ...")
-# - artifact publish steps: artifactName/pathToPublish includes "coverity" or $(COVERITY_...)
-def is_cov_step:
-  (
-    (low(.displayName) | contains("coverity"))
-    or (low(.bash) | contains("cov-"))
-    or (low(.script) | contains("cov-"))
-    or (low(.pwsh) | contains("cov-"))
-    or (low(.powershell) | contains("cov-"))
-    or (low(.inputs.artifactName) | contains("coverity"))
-    or (low(.inputs.ArtifactName) | contains("coverity"))
-    or (low(.inputs.pathToPublish) | contains("coverity") or contains("$(coverity") or contains("$(coverity_"))
-    or (low(.inputs.PathtoPublish) | contains("coverity") or contains("$(coverity") or contains("$(coverity_"))
-  );
-
-# Black Duck detection: detect.sh or "Synopsys Detect"/"Black Duck"
-def has_bd_steps:
-  (.steps // [])
-  | any(
-      (low(.displayName) | contains("black duck") or contains("synopsys detect"))
-      or (low(.bash) | contains("detect.sh") or contains("blackduck.url"))
-      or (low(.script) | contains("detect.sh") or contains("blackduck.url"))
-    );
-
-def delete_cov_vars:
-  if .variables == null then
-    .
-  elif (.variables | type) == "!!map" then
-    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
-  elif (.variables | type) == "!!seq" then
-    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
-  else
-    .
-  end;
-
-def merge_vars(new):
-  if .variables == null then
-    .variables = new
-  elif (.variables | type) == "!!map" then
-    .variables = (.variables * new)
-  elif (.variables | type) == "!!seq" then
-    .variables += (new | to_entries | map({"name": .key, "value": .value}))
-  else
-    .
-  end;
-
-if (has("steps") and (.steps | type) == "!!seq") then
-  # Remove Coverity vars + steps
-  delete_cov_vars
-  | .steps |= map(select(is_cov_step | not))
-
-  # Merge BD vars
-  | merge_vars(load(strenv(BD_VARS)))
-
-  # Inject BD steps if missing (insert after step 0 if steps exist)
-  | (if has_bd_steps then
-       .
-     else
-       if (.steps | length) > 0 then
-         .steps = (.steps[0:1] + load(strenv(BD_STEPS)) + .steps[1:])
-       else
-         .steps = load(strenv(BD_STEPS))
-       end
-     end)
-else
-  .
-end
-YQ
-
+# --- Debug BEFORE ---
 echo "Coverity bash-step count BEFORE (cov- in .bash):"
 yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
-
 echo "BlackDuck detect-step count BEFORE (detect.sh in .bash):"
 yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | length' "${PIPELINE_FILE}" || true
 
 echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
-yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"   # in-place edit is the intended pattern [1](https://github.com/mikefarah/yq/issues/1315)[2](https://linuxcommandlibrary.com/man/yq)
+
+# -------------------------------------------------------------------
+# 1) REMOVE COVERITY: variables + steps (single deterministic yq edit)
+# -------------------------------------------------------------------
+yq e -i '
+  # Drop COVERITY_* variables (handles map or seq)
+  (if .variables == null then .
+   elif (.variables | type) == "!!map" then
+     .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
+   elif (.variables | type) == "!!seq" then
+     .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
+   else .
+   end)
+  |
+  # Drop Coverity steps:
+  # - any bash/script/pwsh/powershell containing cov-
+  # - any displayName/task containing coverity
+  # - any publish step with coverity artifact/path
+  (.steps |= map(
+    select(
+      (
+        ((.bash // "") + " " + (.script // "") + " " + (.pwsh // "") + " " + (.powershell // "")) | test("(?i)cov-")
+      )
+      or (
+        ((.displayName // "") + " " + (.task // "")) | test("(?i)coverity")
+      )
+      or (
+        ((.inputs.artifactName // "") + " " + (.inputs.ArtifactName // "")) | test("(?i)coverity")
+      )
+      or (
+        ((.inputs.pathToPublish // "") + " " + (.inputs.PathtoPublish // "")) | test("(?i)coverity|\\$\\(coverity_")
+      )
+      | not
+    )
+  ))
+' "${PIPELINE_FILE}"
+
+# -------------------------------------------------------------------
+# 2) MERGE BD VARS (safe map merge; your variables are a map)
+# -------------------------------------------------------------------
+yq e -i '
+  .variables = ((.variables // {}) * load(strenv(BD_VARS)))
+' "${PIPELINE_FILE}"
+
+# -------------------------------------------------------------------
+# 3) INJECT BD STEPS if detect.sh not present
+#    Insert right after first step (checkout) if steps exist.
+# -------------------------------------------------------------------
+yq e -i '
+  if (.steps // [] | any((.bash // "") | test("(?i)detect\\.sh"))) then
+    .
+  else
+    .steps = (
+      if (.steps | length) > 0 then
+        .steps[0:1] + load(strenv(BD_STEPS)) + .steps[1:]
+      else
+        load(strenv(BD_STEPS))
+      end
+    )
+  end
+' "${PIPELINE_FILE}"
+
 echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
 
+# --- Debug AFTER ---
 echo "Coverity bash-step count AFTER (cov- in .bash):"
 yq e '(.steps // []) | map(select((.bash // "") | test("(?i)cov-"))) | length' "${PIPELINE_FILE}" || true
-
 echo "BlackDuck detect-step count AFTER (detect.sh in .bash):"
 yq e '(.steps // []) | map(select((.bash // "") | test("(?i)detect\.sh"))) | length' "${PIPELINE_FILE}" || true
 
-# Cleanup
-rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
+# Cleanup temp files
+rm -f "${BD_VARS}" "${BD_STEPS}"
 
 echo "✅ Done. Updated ${PIPELINE_FILE}"
 echo "Backup saved as ${PIPELINE_FILE}.bak"
