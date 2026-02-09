@@ -2,8 +2,6 @@
 set -euo pipefail
 
 PIPELINE_FILE="azure-pipelines.yml"
-
-# If your script runs from repo root but the YAML is inside target/, keep this:
 cd target/
 
 if [[ ! -f "${PIPELINE_FILE}" ]]; then
@@ -23,14 +21,13 @@ echo "Updating: ${PIPELINE_FILE}"
 yq e 'has("steps")' "${PIPELINE_FILE}"
 yq e '.steps | type' "${PIPELINE_FILE}"
 
-# --- Backup ---
+# Backup
 cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
 
-# --- Ensure single-document YAML (removes any trailing docs from older eval-all runs) ---
-# eval-all can emit multiple documents separated by --- unless explicitly selecting one. [1](https://github.com/mikefarah/yq/issues/1642)[2](https://stackoverflow.com/questions/70032588/use-yq-to-substitute-string-in-a-yaml-file)
+# Ensure single-document YAML (remove extra docs if older eval-all appended them)
 yq e -i 'select(di == 0)' "${PIPELINE_FILE}"
 
-# --- Black Duck variables (map) ---
+# --- Black Duck variables ---
 BD_VARS="$(mktemp)"
 cat > "${BD_VARS}" <<'YAML'
 BLACKDUCK_URL: 'https://blackduck.mycompany.com'
@@ -39,7 +36,7 @@ BD_VERSION: '$(Build.SourceBranchName)'
 DETECT_VERSION: 'latest'
 YAML
 
-# --- Black Duck steps (sequence) ---
+# --- Black Duck steps ---
 BD_STEPS="$(mktemp)"
 cat > "${BD_STEPS}" <<'YAML'
 - task: JavaToolInstaller@0
@@ -85,8 +82,6 @@ YAML
 export BD_VARS BD_STEPS
 
 # --- yq transformation program ---
-# Uses recursive descent (..) restricted to strings (tag == "!!str") to robustly match Coverity/BD
-# and avoid missing multiline bash blocks. [3](https://deepwiki.com/mikefarah/yq)[4](https://nonbleedingedge.com/cheatsheets/yq.html)
 YQ_PROG="$(mktemp)"
 cat > "${YQ_PROG}" <<'YQ'
 def step_has(pattern):
@@ -104,3 +99,82 @@ def is_bd:
 def delete_cov_vars:
   if .variables == null then
     .
+  elif (.variables | type) == "!!map" then
+    .variables |= with_entries(select((.key | test("^COVERITY_")) | not))
+  elif (.variables | type) == "!!seq" then
+    .variables |= map(select((.name // "" | test("^COVERITY_")) | not))
+  else
+    .
+  end;
+
+def merge_vars(new):
+  if .variables == null then
+    .variables = new
+  elif (.variables | type) == "!!map" then
+    .variables = (.variables * new)
+  elif (.variables | type) == "!!seq" then
+    .variables += (new | to_entries | map({"name": .key, "value": .value}))
+  else
+    .
+  end;
+
+def first_cov_idx(steps):
+  (steps | to_entries | map(select(.value | is_cov)) | .[0].key);
+
+if (has("steps") and (.steps | type) == "!!seq") then
+  (.steps) as $orig
+  | ($orig | any(. | is_bd)) as $bdAlready
+  | (first_cov_idx($orig)) as $covIdx
+
+  # Always remove COVERITY_* variables and merge BD vars
+  | delete_cov_vars
+  | merge_vars(load(strenv(BD_VARS)))
+
+  # Always remove Coverity steps
+  | (.steps = ($orig | map(select(is_cov | not))))
+
+  # Inject BD steps only if missing
+  | (if $bdAlready then
+       .
+     else
+       if $covIdx == null then
+         .steps = (.steps + load(strenv(BD_STEPS)))
+       else
+         .steps = (
+           $orig[0:$covIdx]
+           + load(strenv(BD_STEPS))
+           + ($orig[$covIdx:] | map(select(is_cov | not)))
+         )
+       end
+     end)
+else
+  .
+end
+YQ
+
+# Safety: ensure heredoc created program properly
+if [[ ! -s "${YQ_PROG}" ]]; then
+  echo "ERROR: YQ program file is empty: ${YQ_PROG}"
+  exit 1
+fi
+
+echo "Before hash:"; sha256sum "${PIPELINE_FILE}" || true
+yq eval -i -f "${YQ_PROG}" "${PIPELINE_FILE}"
+echo "After hash:"; sha256sum "${PIPELINE_FILE}" || true
+
+# Cleanup
+rm -f "${BD_VARS}" "${BD_STEPS}" "${YQ_PROG}"
+
+echo "✅ Done. Updated ${PIPELINE_FILE}"
+echo "Backup saved as ${PIPELINE_FILE}.bak"
+
+echo "Post-check (ignore comments; should show NO real cov-* commands):"
+grep -nE '^[^#]*\bcov-build\b|^[^#]*\bcov-analyze\b|^[^#]*\bcov-format-errors\b|^[^#]*\bcov-commit-defects\b' -n "${PIPELINE_FILE}" \
+  || echo "✅ Coverity commands removed"
+
+echo "Post-check (should show Black Duck):"
+grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}" \
+  || echo "❌ Black Duck not found (unexpected)"
+
+echo "Post-check (single-document YAML; no ---):"
+grep -n '^---$' "${PIPELINE_FILE}" || echo "✅ single-document YAML"
