@@ -19,7 +19,7 @@ STAGE_DL_BRIDGE_NAME='Download Bridge CLI'
 STAGE_BD_NAME='Black Duck via Bridge CLI'
 STAGE_CHECKOUT_NAME='Checkout'
 
-read -r -d '' TEMPLATE_STAGE_DOWNLOAD_BRIDGE <<'EOF'
+TEMPLATE_STAGE_DOWNLOAD_BRIDGE="$(cat <<'EOF'
     stage('Download Bridge CLI') {
       steps {
         sh '''
@@ -38,6 +38,7 @@ read -r -d '' TEMPLATE_STAGE_DOWNLOAD_BRIDGE <<'EOF'
       }
     }
 EOF
+)"
 
 read -r -d '' TEMPLATE_STAGE_BLACKDUCK <<'EOF'
     stage('Black Duck via Bridge CLI') {
