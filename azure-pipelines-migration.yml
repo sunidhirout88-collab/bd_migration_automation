@@ -20,6 +20,9 @@ steps:
   fetchDepth: 1
 
 - bash: |
+    set -Eeuo pipefail
+    trap 'code=$?; echo "ERROR on line ${LINENO} (cmd: ${BASH_COMMAND}) -> $code"; exit $code' ERR
+    set -x
     set -euo pipefail
     cd "$(Build.SourcesDirectory)"
 
@@ -37,7 +40,10 @@ steps:
     echo "Cloning: ${{ parameters.repoUrl }}"
     echo "Branch:  ${{ parameters.branch }}"
     git clone --depth 1 --branch "${{ parameters.branch }}" "${{ parameters.repoUrl }}" target
-
+    echo "Clone result: $?"
+    test -d target && echo "target dir exists" && ls -la target
+    ls -la "$(Build.SourcesDirectory)"
+    test -f migration.sh || { echo "migration.sh not found"; exit 1; }
     chmod +x migration.sh
     bash migration.sh "$(Build.SourcesDirectory)/target"
   displayName: "Clone repo and run migration (commit & push)"
