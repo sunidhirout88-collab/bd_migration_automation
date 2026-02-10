@@ -40,7 +40,7 @@ TEMPLATE_STAGE_DOWNLOAD_BRIDGE="$(cat <<'EOF'
 EOF
 )"
 
-read -r -d '' TEMPLATE_STAGE_BLACKDUCK <<'EOF'
+TEMPLATE_STAGE_BLACKDUCK="$(cat <<'EOF'
     stage('Black Duck via Bridge CLI') {
       steps {
         sh '''
@@ -52,6 +52,7 @@ read -r -d '' TEMPLATE_STAGE_BLACKDUCK <<'EOF'
       }
     }
 EOF
+)"
 
 backup_file() {
   local f="$1"; local ts
