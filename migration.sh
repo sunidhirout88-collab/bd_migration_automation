@@ -61,9 +61,11 @@ backup_file() {
   echo "    Backup: ${f}.bak.${ts}"
 }
 
+
 remove_polaris_stages() {
-  local file="$1" tmp="${file}.tmp.$$"
-  awk '
+  local file="$1"
+  local tmp="${file}.tmp.$$"
+  awk ' ... ' "$file" > "$tmp" && mv "$tmp" "$fil
     BEGIN { skipping=0; level=0 }
     {
       line=$0
@@ -89,9 +91,11 @@ remove_polaris_stages() {
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
+
 ensure_env_bd_credentials() {
-  local file="$1" tmp="${file}.tmp.$$"
-  awk -v bd_url_id="$BD_URL_CRED_ID" -v bd_token_id="$BD_TOKEN_CRED_ID" '
+  local file="$1"
+  local tmp="${file}.tmp.$$"
+  awk -v bd_url_id="$BD_URL_CRED_ID" -v bd_token_id="$BD_TOKEN_CRED_ID" ' ... ' "$file" > "$tmp" && mv "$tmp" "$file"
     BEGIN { in_env=0; bd_url_present=0; bd_token_present=0; env_indent="" }
     {
       line=$0
@@ -131,9 +135,13 @@ has_stage() {
   grep -q "stage('${stage_name}')" "$file"
 }
 
+
 insert_after_stage() {
-  local file="$1" anchor_stage="$2" insert_block="$3" tmp="${file}.tmp.$$"
-  awk -v anchor="$anchor_stage" -v add="$insert_block" '
+  local file="$1"
+  local anchor_stage="$2"
+  local insert_block="$3"
+  local tmp="${file}.tmp.$$"
+  awk -v anchor="$anchor_stage" -v add="$insert_block" ' ... ' "$file" > "$tmp" && mv "$tmp" "$file"
     BEGIN { in_target=0; level=0; printed_add=0 }
     {
       line=$0
@@ -150,13 +158,15 @@ insert_after_stage() {
   ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
+
 ensure_download_before_bd() {
-  local file="$1" tmp="${file}.tmp.$$"
+  local file="$1"
+  local tmp="${file}.tmp.$$"
   has_stage "$file" "$STAGE_BD_NAME" || return 0
   has_stage "$file" "$STAGE_DL_BRIDGE_NAME" && return 0
   awk -v bd="stage(\x27'"$STAGE_BD_NAME"'\x27)" -v dlblk="$TEMPLATE_STAGE_DOWNLOAD_BRIDGE" '
     { line=$0; if (line ~ bd) { print dlblk } ; print line }
-  ' "$file" > "$tmp" && mv "$tmp" "$file"
+  ' "$file" > "$tmp" && mv "$tmp" "$file
 }
 
 # Discover Jenkinsfiles
