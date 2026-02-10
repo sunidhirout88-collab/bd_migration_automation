@@ -1,298 +1,335 @@
 #!/usr/bin/env bash
 set -euo pipefail
-TARGET_BRANCH="${TARGET_BRANCH:-}"      # If empty, script tries to detect current branch
-GITHUB_TOKEN="${GITHUB_TOKEN:-}"        # GitHub PAT (should be injected as secret env var)
 
-# Optional: commit message
-COMMIT_MESSAGE="${COMMIT_MESSAGE:-removed coverity}"
-# ---------- Resolve script location safely ----------
-SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# ------------------------------------------------------------------------------
+# repo_migrate_polaris_to_blackduck.sh
+#
+# Scans the current (or git) repo for Jenkinsfiles and:
+#  - Removes "Polaris" stages
+#  - Inserts "Download Bridge CLI" and "Black Duck via Bridge CLI" stages
+#  - Updates environment block: removes POLARIS_*; ensures BLACKDUCK_* credentials
+#
+# Safe to run multiple times; creates timestamped backups.
+#
+# Usage:
+#   bash repo_migrate_polaris_to_blackduck.sh
+#
+# Optional flags:
+#   --dry-run   : Show which files would change; do not modify files.
+#   --root PATH : Treat PATH as repo root (default: auto git root or current dir)
+# ------------------------------------------------------------------------------
 
-echo "SCRIPT PATH: ${SCRIPT_PATH}"
-echo "SCRIPT HASH: $(sha256sum "${SCRIPT_PATH}" | awk '{print $1}')"
+# ===== Configurable: Credential IDs used in Jenkins ============================
+BD_URL_CRED_ID="blackduck-url"
+BD_TOKEN_CRED_ID="blackduck-api-token"
 
-# ---------- Move to folder containing azure-pipelines.yml ----------
-if [[ -f "${SCRIPT_DIR}/target/azure-pipelines.yml" ]]; then
-  cd "${SCRIPT_DIR}/target"
-elif [[ -f "${SCRIPT_DIR}/azure-pipelines.yml" ]]; then
-  cd "${SCRIPT_DIR}"
-else
-  echo "ERROR: Cannot locate azure-pipelines.yml in ${SCRIPT_DIR} or ${SCRIPT_DIR}/target"
-  exit 1
+# ===== Stage names (do not include regex here to avoid escaping surprises) =====
+STAGE_DL_BRIDGE_NAME='Download Bridge CLI'
+STAGE_BD_NAME='Black Duck via Bridge CLI'
+STAGE_CHECKOUT_NAME='Checkout'
+
+# ===== Stage Templates =========================================================
+read -r -d '' TEMPLATE_STAGE_DOWNLOAD_BRIDGE <<'EOF'
+    stage('Download Bridge CLI') {
+      steps {
+        sh '''
+          set -euo pipefail
+          mkdir -p .ci-tools
+          # TODO: Replace with your actual download (curl/wget/artifactory)
+          # Example:
+          #   curl -sSL -o .ci-tools/bridge "<YOUR_BRIDGE_CLI_URL>"
+          #   chmod +x .ci-tools/bridge
+          # Placeholder to avoid failures if not yet wired:
+          if [ ! -x .ci-tools/bridge ]; then
+            printf '#!/usr/bin/env bash\necho "Bridge CLI placeholder. Replace with real download."\n' > .ci-tools/bridge
+            chmod +x .ci-tools/bridge
+          fi
+        '''
+      }
+    }
+EOF
+
+read -r -d '' TEMPLATE_STAGE_BLACKDUCK <<'EOF'
+    stage('Black Duck via Bridge CLI') {
+      steps {
+        sh '''
+          set -euo pipefail
+          test -x .ci-tools/bridge
+          # Ensure bridge.yml has a "blackduck" stage configured
+          .ci-tools/bridge --stage blackduck --input bridge.yml
+        '''
+      }
+    }
+EOF
+
+# ===== CLI flags ===============================================================
+DRY_RUN="false"
+REPO_ROOT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN="true"; shift ;;
+    --root) REPO_ROOT="${2:-}"; shift 2 ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
+  esac
+done
+
+# ===== Resolve repo root =======================================================
+if [[ -z "${REPO_ROOT}" ]]; then
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    REPO_ROOT="$(git rev-parse --show-toplevel)"
+  else
+    REPO_ROOT="$(pwd)"
+  fi
 fi
+cd "$REPO_ROOT"
 
-PIPELINE_FILE="azure-pipelines.yml"
-echo "PWD: $(pwd)"
-echo "Editing: ${PIPELINE_FILE}"
+echo "Repo root: $REPO_ROOT"
+[[ "$DRY_RUN" == "true" ]] && echo "[DRY-RUN] No files will be modified."
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "ERROR: python3 is required on the agent."
-  exit 1
-fi
-
-# Backup
-cp -p "${PIPELINE_FILE}" "${PIPELINE_FILE}.bak"
-echo "Backup saved as ${PIPELINE_FILE}.bak"
-
-# Install ruamel.yaml (preserves comments/format much better than plain PyYAML)
-python3 -m pip -q install --user ruamel.yaml >/dev/null 2>&1 || {
-  echo "ERROR: failed to install ruamel.yaml (pip)."
-  exit 1
+# ===== Helper: create timestamped backup ======================================
+backup_file() {
+  local f="$1"
+  local ts; ts="$(date +%Y%m%d_%H%M%S)"
+  cp -p -- "$f" "${f}.bak.${ts}"
+  echo "  Backup: ${f}.bak.${ts}"
 }
 
-python3 - <<'PY'
-import re
-from copy import deepcopy
-from ruamel.yaml import YAML
+# ===== Helper: remove Polaris stages by stage name match ======================
+remove_polaris_stages() {
+  local file="$1" tmp="${file}.tmp.$$"
 
-PIPELINE_FILE = "azure-pipelines.yml"
-
-COV_RE = re.compile(r"\bcov-", re.IGNORECASE)
-COVERITY_RE = re.compile(r"\bcoverity\b", re.IGNORECASE)
-BD_RE = re.compile(r"(synopsys detect|detect\.sh|blackduck\.url|black duck)", re.IGNORECASE)
-
-BD_VARS = {
-    "BLACKDUCK_URL": "https://blackduck.mycompany.com",
-    "BD_PROJECT": "my-app",
-    "BD_VERSION": "$(Build.SourceBranchName)",
-    "DETECT_VERSION": "latest",
+  # We remove any stage whose title contains "Polaris" (case-sensitive by Jenkins convention)
+  awk '
+    function count(s, ch,   n){ n=gsub(ch,"",s); return n }
+    BEGIN { skipping=0; level=0 }
+    {
+      line=$0
+      if (!skipping) {
+        # Detect stage header line with name containing Polaris
+        if (match(line, /stage[[:space:]]*\([[:space:]]*'\''[^'\'']*Polaris[^'\'']*'\''[[:space:]]*\)/)) {
+          # Start skipping from this line until the matching block closes
+          skipping=1
+          # If this line contains any { or } adjust level now
+          openC = gsub(/\{/,"{",line)
+          closeC = gsub(/\}/,"}",line)
+          level += openC - closeC
+          next
+        } else {
+          print line
+          # If this non-stage line includes braces, keep overall balance (not necessary here)
+          next
+        }
+      } else {
+        # We are skipping a Polaris stage block
+        openC = gsub(/\{/,"{",line)
+        closeC = gsub(/\}/,"}",line)
+        level += openC - closeC
+        # End skipping when block level balances back to <=0 (we passed closing brace)
+        if (level <= 0) {
+          skipping=0
+          level=0
+        }
+        next
+      }
+    }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-BD_STEPS = [
+# ===== Helper: Update environment block =======================================
+# - Remove POLARIS_* lines
+# - Ensure BLACKDUCK_URL and BLACKDUCK_API_TOKEN exist (with credential IDs)
+ensure_env_bd_credentials() {
+  local file="$1" tmp="${file}.tmp.$$"
+  awk -v bd_url_id="$BD_URL_CRED_ID" -v bd_token_id="$BD_TOKEN_CRED_ID" '
+    BEGIN {
+      in_env=0
+      bd_url_present=0
+      bd_token_present=0
+      env_indent=""
+    }
+    # Helper to trim leading spaces
+    function ltrim(s){ sub(/^[ \t\r\n]+/, "", s); return s }
     {
-        "task": "JavaToolInstaller@0",
-        "displayName": "Use Java 11",
-        "inputs": {
-            "versionSpec": "11",
-            "jdkArchitectureOption": "x64",
-            "jdkSourceOption": "PreInstalled",
-        },
-    },
+      line=$0
+
+      if (!in_env) {
+        # Detect start of environment block
+        if (match(line, /^[ \t]*environment[ \t]*\{/)) {
+          in_env=1
+          # capture indentation (non-destructive)
+          match(line, /^([ \t]*)environment[ \t]*\{/, m)
+          env_indent=m[1]
+          print line
+          next
+        } else {
+          print line
+          next
+        }
+      } else {
+        # Inside environment block
+        # Check for closing brace at this nesting level (approximate)
+        if (match(line, /^[ \t]*\}/)) {
+          # Before closing, ensure BD vars exist
+          if (!bd_url_present) {
+            print env_indent "  BLACKDUCK_URL = credentials(\x27" bd_url_id "\x27)"
+          }
+          if (!bd_token_present) {
+            print env_indent "  BLACKDUCK_API_TOKEN = credentials(\x27" bd_token_id "\x27)"
+          }
+          print line
+          in_env=0
+          next
+        }
+
+        # Skip Polaris lines entirely
+        if (line ~ /POLARIS_SERVER_URL[ \t]*=/ || line ~ /POLARIS_ACCESS_TOKEN[ \t]*=/) {
+          # skip
+          next
+        }
+
+        # Detect if BD lines already present
+        if (line ~ /BLACKDUCK_URL[ \t]*=/)   { bd_url_present=1 }
+        if (line ~ /BLACKDUCK_API_TOKEN[ \t]*=/) { bd_token_present=1 }
+
+        print line
+        next
+      }
+    }
+    END {
+      # If no environment block existed at all, create one at end
+      if (!in_env && bd_url_present==0 && bd_token_present==0) {
+        print ""
+        print "  environment {"
+        print "    BLACKDUCK_URL = credentials(\x27" bd_url_id "\x27)"
+        print "    BLACKDUCK_API_TOKEN = credentials(\x27" bd_token_id "\x27)"
+        print "  }"
+      }
+    }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# ===== Helper: Does a stage with exact name exist? ============================
+has_stage() {
+  local file="$1" stage_name="$2"
+  grep -q "stage('${stage_name}')" "$file"
+}
+
+# ===== Helper: Insert stages after a specific stage block =====================
+insert_after_stage() {
+  local file="$1" anchor_stage="$2" insert_block="$3" tmp="${file}.tmp.$$"
+
+  awk -v anchor="$anchor_stage" -v add="$insert_block" '
+    BEGIN { in_target=0; level=0; printed_add=0 }
     {
-        "bash": "\n".join([
-            "set -euo pipefail",
-            "",
-            'echo "Downloading Synopsys Detect..."',
-            "curl -fsSL -o detect.sh https://detect.synopsys.com/detect.sh",
-            "chmod +x detect.sh",
-            "",
-            'echo "Running Black Duck scan via Synopsys Detect..."',
-            "./detect.sh \\",
-            '  --blackduck.url="$(BLACKDUCK_URL)" \\',
-            '  --blackduck.api.token="$(BLACKDUCK_API_TOKEN)" \\',
-            '  --detect.project.name="$(BD_PROJECT)" \\',
-            '  --detect.project.version.name="$(BD_VERSION)" \\',
-            '  --detect.source.path="$(Build.SourcesDirectory)" \\',
-            "  --detect.tools=DETECTOR,SIGNATURE_SCAN \\",
-            "  --detect.detector.search.depth=6 \\",
-            "  --detect.wait.for.results=true \\",
-            "  --detect.notices.report=true \\",
-            "  --detect.risk.report.pdf=true \\",
-            "  --logging.level.com.synopsys.integration=INFO \\",
-            "  --detect.cleanup=true",
-        ]),
-        "displayName": "Black Duck Scan (Synopsys Detect)",
-        "env": {"BLACKDUCK_API_TOKEN": "$(BLACKDUCK_API_TOKEN)"},
-    },
+      line=$0
+      print line
+      if (printed_add) next
+
+      if (line ~ "stage(\x27" anchor "\x27)") {
+        in_target=1
+      }
+      if (in_target) {
+        # Track braces to find end of this stage block
+        openC = gsub(/\{/,"{",line)
+        closeC = gsub(/\}/,"}",line)
+        level += openC - closeC
+        if (level <= 0) {
+          # End of block: insert our content
+          print add
+          printed_add=1
+          in_target=0
+          level=0
+        }
+      }
+    }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# ===== Helper: Insert Download before Black Duck if missing ===================
+ensure_download_before_bd() {
+  local file="$1" tmp="${file}.tmp.$$"
+
+  # Only if BD stage exists and Download stage does not
+  has_stage "$file" "$STAGE_BD_NAME" || return 0
+  has_stage "$file" "$STAGE_DL_BRIDGE_NAME" && return 0
+
+  # Insert Download immediately before BD stage
+  awk -v bd="stage(\x27'"$STAGE_BD_NAME"'\x27)" -v dlblk="$TEMPLATE_STAGE_DOWNLOAD_BRIDGE" '
     {
-        "task": "PublishBuildArtifacts@1",
-        "displayName": "Publish Black Duck Reports",
-        "inputs": {
-            "PathtoPublish": "$(Build.SourcesDirectory)/blackduck",
-            "ArtifactName": "blackduck-reports",
-        },
-        "condition": "succeededOrFailed()",
-    },
-]
+      line=$0
+      if (line ~ bd) {
+        print dlblk
+      }
+      print line
+    }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
 
-def step_text(step):
-    if not isinstance(step, dict):
-        return ""
-    parts = []
-    for k in ("displayName","task","bash","script","pwsh","powershell"):
-        v = step.get(k)
-        if isinstance(v, str):
-            parts.append(v)
-    inputs = step.get("inputs", {})
-    if isinstance(inputs, dict):
-        for k, v in inputs.items():
-            parts.append(f"{k}={v}")
-    return "\n".join(parts).lower()
-
-def is_coverity_step(step):
-    t = step_text(step)
-    if COV_RE.search(t) or COVERITY_RE.search(t):
-        return True
-    inputs = step.get("inputs", {}) if isinstance(step, dict) else {}
-    if isinstance(inputs, dict):
-        art = str(inputs.get("artifactName", inputs.get("ArtifactName",""))).lower()
-        pth = str(inputs.get("pathToPublish", inputs.get("PathtoPublish",""))).lower()
-        if "coverity" in art or "coverity" in pth or "$(coverity_" in pth:
-            return True
-    return False
-
-def has_blackduck(pipeline):
-    return any(BD_RE.search(step_text(s)) for s in (pipeline.get("steps") or []))
-
-def coverity_bash_count(pipeline):
-    c = 0
-    for s in pipeline.get("steps") or []:
-        if isinstance(s, dict) and isinstance(s.get("bash"), str) and COV_RE.search(s["bash"]):
-            c += 1
-    return c
-
-def detect_bash_count(pipeline):
-    c = 0
-    for s in pipeline.get("steps") or []:
-        if isinstance(s, dict) and isinstance(s.get("bash"), str) and re.search(r"detect\.sh", s["bash"], re.I):
-            c += 1
-    return c
-
-def drop_coverity_vars(vars_node):
-    if vars_node is None:
-        return None
-    if isinstance(vars_node, dict):
-        return {k:v for k,v in vars_node.items() if not str(k).startswith("COVERITY_")}
-    if isinstance(vars_node, list):
-        out=[]
-        for item in vars_node:
-            if isinstance(item, dict) and str(item.get("name","")).startswith("COVERITY_"):
-                continue
-            out.append(item)
-        return out
-    return vars_node
-
-def merge_bd_vars(vars_node):
-    if vars_node is None:
-        return deepcopy(BD_VARS)
-    if isinstance(vars_node, dict):
-        merged = dict(vars_node)
-        merged.update(BD_VARS)
-        return merged
-    if isinstance(vars_node, list):
-        out = list(vars_node)
-        existing = {i.get("name") for i in out if isinstance(i, dict)}
-        for k,v in BD_VARS.items():
-            if k not in existing:
-                out.append({"name": k, "value": v})
-        return out
-    return vars_node
-
-def inject_bd_steps(steps):
-    steps = steps or []
-    # insert after first step (usually checkout)
-    if len(steps) >= 1:
-        return [steps[0]] + deepcopy(BD_STEPS) + steps[1:]
-    return deepcopy(BD_STEPS)
-
-yaml = YAML()
-yaml.preserve_quotes = True
-yaml.indent(mapping=2, sequence=2, offset=0)
-
-with open(PIPELINE_FILE, "r", encoding="utf-8") as f:
-    pipeline = yaml.load(f)
-
-if not isinstance(pipeline, dict):
-    raise SystemExit("ERROR: pipeline root is not a YAML map/object.")
-
-print("Coverity bash-step count BEFORE:", coverity_bash_count(pipeline))
-print("Detect bash-step count BEFORE:", detect_bash_count(pipeline))
-
-# variables: remove coverity + merge BD
-pipeline["variables"] = merge_bd_vars(drop_coverity_vars(pipeline.get("variables")))
-
-# steps: remove coverity
-steps = pipeline.get("steps") or []
-if not isinstance(steps, list):
-    steps = []
-steps = [s for s in steps if not (isinstance(s, dict) and is_coverity_step(s))]
-pipeline["steps"] = steps
-
-# inject BD steps if missing
-if not has_blackduck(pipeline):
-    pipeline["steps"] = inject_bd_steps(pipeline["steps"])
-
-print("Coverity bash-step count AFTER:", coverity_bash_count(pipeline))
-print("Detect bash-step count AFTER:", detect_bash_count(pipeline))
-
-with open(PIPELINE_FILE, "w", encoding="utf-8") as f:
-    yaml.dump(pipeline, f)
-
-print("✅ Migration complete:", PIPELINE_FILE)
-PY
-
-echo "Post-check Coverity (should be EMPTY):"
-if grep -nE '^[^#]*\bcov-' -n "${PIPELINE_FILE}"; then
-  echo "❌ Coverity still present"
-  exit 1
-else
-  echo "✅ Coverity removed"
+# ===== Discover Jenkinsfiles ===================================================
+# Priority: tracked by git; then fallback to filesystem search
+declare -a JFILES=()
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  while IFS= read -r f; do
+    # Filter to Jenkinsfile-like paths
+    if [[ "$(basename "$f")" =~ ^[Jj]enkinsfile$ ]]; then
+      JFILES+=("$f")
+    fi
+  done < <(git ls-files)
 fi
 
-echo "Post-check Black Duck (should show detect.sh or Black Duck Scan):"
-if grep -nE "Synopsys Detect|detect\.sh|Black Duck Scan" -n "${PIPELINE_FILE}"; then
-  echo "✅ Black Duck present"
-else
-  echo "❌ Black Duck NOT found"
-  exit 1
+# Add untracked / general matches
+while IFS= read -r f; do
+  # Skip .git directories just in case
+  [[ "$f" == *"/.git/"* ]] && continue
+  JFILES+=("$f")
+done < <(find . -type f \( -iname 'Jenkinsfile' -o -iname 'jenkinsfile' \) -not -path '*/.git/*')
+
+# Deduplicate
+if [[ "${#JFILES[@]}" -eq 0 ]]; then
+  echo "No Jenkinsfiles found."
+  exit 0
 fi
-cat "${PIPELINE_FILE}"
-#git config user.email "pipeline-bot@example.com"
-#git config user.name  "pipeline-bot"
+mapfile -t JFILES < <(printf "%s\n" "${JFILES[@]}" | awk '!seen[$0]++' | sort)
 
-#git add -A
+echo "Found ${#JFILES[@]} Jenkinsfile(s):"
+printf '  - %s\n' "${JFILES[@]}"
 
-# Commit (if nothing staged, don't fail)
-#git commit -m "$COMMIT_MESSAGE" || true
+# ===== Process each Jenkinsfile ==============================================
+for jf in "${JFILES[@]}"; do
+  echo ""
+  echo "Processing: $jf"
 
-# Push using HTTP header auth (avoid putting token in the URL / printing it)
-# Azure DevOps guidance: avoid exposing secrets in logs/command line; use secret vars/env. [3](https://www.geeksforgeeks.org/python/how-to-define-and-call-a-function-in-python/)
-# GitHub requires token-based auth for HTTPS pushes. [4](https://thebottleneckdev.com/blog/processing-yaml-files)
-#AUTH_B64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "  [DRY-RUN] Would back up and modify $jf"
+    continue
+  fi
 
-# Disable xtrace during push to reduce accidental leakage
-#set +x
-#git -c http.extraheader="AUTHORIZATION: basic ${AUTH_B64}" push origin "HEAD:${TARGET_BRANCH}"
-#set -x
+  backup_file "$jf"
 
-#echo "Push completed to branch: ${TARGET_BRANCH}"
-# Determine target branch if not provided
-if [[ -z "$TARGET_BRANCH" ]]; then
-  # Try to detect current branch
-  TARGET_BRANCH="$(git rev-parse --abbrev-ref HEAD || true)"
-fi
+  # 1) Remove all stages with "Polaris" in their name
+  remove_polaris_stages "$jf"
 
-if [[ -z "$TARGET_BRANCH" || "$TARGET_BRANCH" == "HEAD" ]]; then
-  echo "ERROR: Could not determine TARGET_BRANCH (detached HEAD?). Set TARGET_BRANCH env var."
-  exit 1
-fi
+  # 2) Ensure environment has Black Duck credentials and remove POLARIS_* entries
+  ensure_env_bd_credentials "$jf"
 
-# Need token for push
-if [[ -z "$GITHUB_TOKEN" ]]; then
-  echo "ERROR: GITHUB_TOKEN is not set. Configure it as an Azure DevOps secret variable and pass via env."
-  exit 1
-fi
+  # 3) Decide insertion point:
+  #    If Black Duck stage not present, insert Download + Black Duck after Checkout
+  if ! has_stage "$jf" "$STAGE_BD_NAME"; then
+    combined_block=$(printf "%s\n%s\n" "$TEMPLATE_STAGE_DOWNLOAD_BRIDGE" "$TEMPLATE_STAGE_BLACKDUCK")
+    if has_stage "$jf" "$STAGE_CHECKOUT_NAME"; then
+      insert_after_stage "$jf" "$STAGE_CHECKOUT_NAME" "$combined_block"
+    else
+      # If no Checkout stage, append at end of file safely
+      printf "\n%s\n%s\n" "$TEMPLATE_STAGE_DOWNLOAD_BRIDGE" "$TEMPLATE_STAGE_BLACKDUCK" >> "$jf"
+    fi
+  fi
 
-echo "Preparing to commit & push to branch: $TARGET_BRANCH"
+  # 4) If BD exists but Download does not, insert Download right before BD
+  ensure_download_before_bd "$jf"
 
-# Configure author
-git config user.email "pipeline-bot@example.com"
-git config user.name  "pipeline-bot"
+  echo "  Updated: $jf"
+done
 
-git add -A
-
-# Commit (if nothing staged, don't fail)
-git commit -m "$COMMIT_MESSAGE" || true
-
-# Push using HTTP header auth (avoid putting token in the URL / printing it)
-# Azure DevOps guidance: avoid exposing secrets in logs/command line; use secret vars/env. [3](https://www.geeksforgeeks.org/python/how-to-define-and-call-a-function-in-python/)
-# GitHub requires token-based auth for HTTPS pushes. [4](https://thebottleneckdev.com/blog/processing-yaml-files)
-AUTH_B64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
-
-# Disable xtrace during push to reduce accidental leakage
-set +x
-git -c http.extraheader="AUTHORIZATION: basic ${AUTH_B64}" push origin "HEAD:${TARGET_BRANCH}"
-set -x
-
-echo "Push completed to branch: ${TARGET_BRANCH}"
+echo ""
+echo "Done."
+``
