@@ -69,7 +69,6 @@ remove_polaris_stages() {
     {
       line=$0
       if (!skipping) {
-        # Match: stage('<...Polaris...>')
         if (line ~ /stage[[:space:]]*\([[:space:]]*\047[^\047]*Polaris[^\047]*\047[[:space:]]*\)/) {
           skipping=1; level=0; found_open=0
           # fall through to count braces on this same line
