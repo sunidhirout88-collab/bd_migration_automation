@@ -16,40 +16,40 @@ STAGE_DL_BRIDGE_NAME='Download Bridge CLI'
 STAGE_BD_NAME='Black Duck via Bridge CLI'
 STAGE_CHECKOUT_NAME='Checkout'
 
-# ---- Stage templates (no interpolation due to single-quoted here-doc) ----
-TEMPLATE_STAGE_DOWNLOAD_BRIDGE="$(cat <<'EOF'
-    stage('Download Bridge CLI') {
-      steps {
-        sh '''
-          set -euo pipefail
-          mkdir -p .ci-tools
-          # TODO: Replace with your actual download (curl/wget/artifactory)
-          # Example:
-          #   curl -sSL -o .ci-tools/bridge "<YOUR_BRIDGE_CLI_URL>"
-          #   chmod +x .ci-tools/bridge
-          # Placeholder:
-          if [ ! -x .ci-tools/bridge ]; then
-            printf '#!/usr/bin/env bash\necho "Bridge CLI placeholder. Replace with real download."\n' > .ci-tools/bridge
-            chmod +x .ci-tools/bridge
-          fi
-        '''
-      }
-    }
-EOF
+# ---- Stage templates built with printf (no heredocs) ----
+TEMPLATE_STAGE_DOWNLOAD_BRIDGE="$(
+  printf "%s\n" \
+"    stage('Download Bridge CLI') {" \
+"      steps {" \
+"        sh '''" \
+"          set -euo pipefail" \
+"          mkdir -p .ci-tools" \
+"          # TODO: Replace with your actual download (curl/wget/artifactory)" \
+"          # Example:" \
+"          #   curl -sSL -o .ci-tools/bridge \"<YOUR_BRIDGE_CLI_URL>\"" \
+"          #   chmod +x .ci-tools/bridge" \
+"          # Placeholder:" \
+"          if [ ! -x .ci-tools/bridge ]; then" \
+"            printf '#!/usr/bin/env bash\necho \"Bridge CLI placeholder. Replace with real download.\"\n' > .ci-tools/bridge" \
+"            chmod +x .ci-tools/bridge" \
+"          fi" \
+"        '''" \
+"      }" \
+"    }"
 )"
 
-TEMPLATE_STAGE_BLACKDUCK="$(cat <<'EOF'
-    stage('Black Duck via Bridge CLI') {
-      steps {
-        sh '''
-          set -euo pipefail
-          test -x .ci-tools/bridge
-          # Ensure bridge.yml has a "blackduck" stage configured
-          .ci-tools/bridge --stage blackduck --input bridge.yml
-        '''
-      }
-    }
-EOF
+TEMPLATE_STAGE_BLACKDUCK="$(
+  printf "%s\n" \
+"    stage('Black Duck via Bridge CLI') {" \
+"      steps {" \
+"        sh '''" \
+"          set -euo pipefail" \
+"          test -x .ci-tools/bridge" \
+"          # Ensure bridge.yml has a \"blackduck\" stage configured" \
+"          .ci-tools/bridge --stage blackduck --input bridge.yml" \
+"        '''" \
+"      }" \
+"    }"
 )"
 
 backup_file() {
@@ -86,7 +86,6 @@ remove_polaris_stages() {
           level += openC - closeC
           found_open=1
         }
-        # If opening brace not yet seen, continue skipping
         if (!found_open) next
       } else {
         level += openC - closeC
@@ -214,3 +213,37 @@ ensure_download_before_bd() {
   has_stage "$file" "$STAGE_DL_BRIDGE_NAME" && return 0
   awk -v bd="stage\\(\x27'"$STAGE_BD_NAME"'\\x27\\)" -v dlblk="$TEMPLATE_STAGE_DOWNLOAD_BRIDGE" '
     {
+      line=$0
+      if (line ~ bd) {
+        print dlblk
+      }
+      print line
+    }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# ---- Discover and process Jenkinsfiles ----
+mapfile -t jfiles < <(find . -type f \( -iname 'Jenkinsfile' -o -iname 'jenkinsfile' \) -not -path '*/.git/*' | sort)
+echo "Jenkinsfiles found: ${#jfiles[@]}"
+for jf in "${jfiles[@]}"; do echo "  -> $jf"; done
+
+for jf in "${jfiles[@]}"; do
+  echo "Processing $jf"
+  backup_file "$jf"
+
+  remove_polaris_stages "$jf"
+  ensure_env_bd_credentials "$jf"
+
+  if ! has_stage "$jf" "$STAGE_BD_NAME"; then
+    combined_block=$(printf "%s\n%s\n" "$TEMPLATE_STAGE_DOWNLOAD_BRIDGE" "$TEMPLATE_STAGE_BLACKDUCK")
+    if has_stage "$jf" "$STAGE_CHECKOUT_NAME"; then
+      insert_after_stage "$jf" "$STAGE_CHECKOUT_NAME" "$combined_block"
+    else
+      # If no Checkout stage, append both at the end
+      printf "\n%s\n%s\n" "$TEMPLATE_STAGE_DOWNLOAD_BRIDGE" "$TEMPLATE_STAGE_BLACKDUCK" >> "$jf"
+    fi
+  fi
+
+  ensure_download_before_bd "$jf"
+  echo "Done $jf"
+done
