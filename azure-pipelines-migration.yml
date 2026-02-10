@@ -46,29 +46,30 @@ steps:
     test -f migration.sh || { echo "migration.sh not found"; exit 1; }
     chmod +x migration.sh
     bash migration.sh "$(Build.SourcesDirectory)/target"
-    cd "$(Build.SourcesDirectory)/target"
+    # inside the same Bash step, after running migration.sh
+cd "$(Build.SourcesDirectory)/target"
 
-    # Show changes (if any)
-    git status --porcelain
+# Show changes (if any)
+git status --porcelain
 
-    CHANGES=$(git status --porcelain | wc -l)
-    if [ "$CHANGES" -gt 0 ]; then
-       git config user.name  "azure-pipelines-bot"
-       git config user.email "azure-pipelines-bot@users.noreply.github.com"
-       git add -A
-       git commit -m "Migrate Polaris → Black Duck (Bridge CLI) [automated]"
+CHANGES=$(git status --porcelain | wc -l)
+if [ "$CHANGES" -gt 0 ]; then
+  git config user.name  "azure-pipelines-bot"
+  git config user.email "azure-pipelines-bot@users.noreply.github.com"
+  git add -A
+  git commit -m "Migrate Polaris → Black Duck (Bridge CLI) [automated]"
 
-      : "${GITHUB_TOKEN:?Set a secret variable GITHUB_TOKEN with repo:write rights}"
-      ORIGIN_URL=$(git remote get-url origin)
-      ORIGIN_URL_PUSH="${ORIGIN_URL/https:\/\//https:\/\/x-access-token:${GITHUB_TOKEN}@}"
+  : "${GITHUB_TOKEN:?Set a secret variable GITHUB_TOKEN with repo:write rights}"
+  ORIGIN_URL=$(git remote get-url origin)
+  ORIGIN_URL_PUSH="${ORIGIN_URL/https:\/\//https:\/\/x-access-token:${GITHUB_TOKEN}@}"
 
-      git remote set-url origin "$ORIGIN_URL_PUSH"
-      git push origin "HEAD:${{ parameters.branch }}"
-      echo "Pushed changes to ${{ parameters.branch }}"
-  else
-      echo "No changes to commit."
-  fi
-  ``
+  git remote set-url origin "$ORIGIN_URL_PUSH"
+  git push origin "HEAD:${{ parameters.branch }}"
+  echo "Pushed changes to ${{ parameters.branch }}"
+else
+  echo "No changes to commit."
+fi
+``
   displayName: "Clone repo and run migration (commit & push)"
   env:
     # Secret PAT for GitHub push (Azure DevOps recommends secret vars over CLI args) [1](https://www.geeksforgeeks.org/python/how-to-define-and-call-a-function-in-python/)
