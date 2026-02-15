@@ -37,6 +37,7 @@ steps:
     echo "Cloning: ${{ parameters.repoUrl }}"
     echo "Branch:  ${{ parameters.branch }}"
     git clone --depth 1 --branch "${{ parameters.branch }}" "${{ parameters.repoUrl }}" target
+    git remote set-url origin "https://${GITHUB_PAT}@github.com/sunidhirout88-collab/blackduck_migration_test.git"
 
     chmod +x migration.sh
     bash migration.sh "$(Build.SourcesDirectory)/target"
