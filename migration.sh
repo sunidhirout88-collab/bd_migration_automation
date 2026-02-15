@@ -34,7 +34,7 @@ migrate_plugin() {
   ' "$f" > "$f.on.tmp" || true
 
   {
-    # Use preserved triggers if found; otherwise use workflow_dispatch
+    # Use preserved triggers if found; otherwise default to workflow_dispatch
     if grep -q '^on:' "$f.on.tmp" 2>/dev/null; then
       sed -n '2,$p' "$f.on.tmp"
     else
@@ -55,7 +55,7 @@ jobs:
       - name: Black Duck SCA - Security Scan
         uses: blackduck-inc/black-duck-security-scan@v2
         with:
-          # Required (configure these in GitHub → Settings → Secrets and variables → Actions)
+          # Required (configure in GitHub → Settings → Secrets and variables → Actions)
           blackducksca_url: ${{ vars.BLACKDUCK_URL }}
           blackducksca_token: ${{ secrets.BLACKDUCK_TOKEN }}
 
@@ -154,6 +154,16 @@ done
 shopt -u nullglob
 
 $found_any || die "No workflow files found under $WORKFLOWS_DIR"
+
+# --- ensure git identity locally (only if missing) ---
+if [[ -z "$(git -C "$REPO_DIR" config user.name || true)" ]]; then
+  msg "Configuring local git user.name"
+  git -C "$REPO_DIR" config user.name "ADO Migration Bot"
+fi
+if [[ -z "$(git -C "$REPO_DIR" config user.email || true)" ]]; then
+  msg "Configuring local git user.email"
+  git -C "$REPO_DIR" config user.email "ado-bot@your-company.com"
+fi
 
 # --- robust commit & push ---
 if $changed && [[ "${AUTO_COMMIT}" == "true" ]]; then
