@@ -9,8 +9,7 @@ COMMIT_BRANCH="${COMMIT_BRANCH:-}"           # if set, checkout/create this bran
 COMMIT_MESSAGE="${COMMIT_MESSAGE:-migrate: Polaris → Black Duck SCA}"
 
 # --- helpers ---
-die() { echo "ERROR: $*" >&2; exit 1; }
-
+die() { echo "ERROR: $*"; exit 1; }
 msg() { echo "==> $*"; }
 
 [[ -d "$WORKFLOWS_DIR" ]] || die "No .github/workflows directory at $WORKFLOWS_DIR"
@@ -27,18 +26,13 @@ migrate_plugin() {
   msg "Migrating (Plugin→Action): $f"
   cp -f "$f" "$f.bak"
 
-  # Replace synopsys-action block with Black Duck SCA action block.
-  # We overwrite the job steps for simplicity/reliability.
-  # Strategy: if file contains synopsys-sig/synopsys-action, rewrite
-  # a minimal BD action workflow preserving 'on:' if present.
-  # 1) Extract 'on:' section (if any)
+  # Extract existing 'on:' section if present to preserve triggers
   awk '
     BEGIN{print "---"}
     /^on:/{flag=1}
     flag{print; if ($0 ~ /^[^[:space:]]/ && $0 !~ /^on:/ && NR>1) flag=0}
   ' "$f" > "$f.on.tmp" || true
 
-  # Rebuild file
   {
     # Use preserved triggers if found; otherwise use workflow_dispatch
     if grep -q '^on:' "$f.on.tmp" 2>/dev/null; then
@@ -61,14 +55,18 @@ jobs:
       - name: Black Duck SCA - Security Scan
         uses: blackduck-inc/black-duck-security-scan@v2
         with:
+          # Required (configure these in GitHub → Settings → Secrets and variables → Actions)
           blackducksca_url: ${{ vars.BLACKDUCK_URL }}
           blackducksca_token: ${{ secrets.BLACKDUCK_TOKEN }}
-          # Optional quality gate:
+
+          # Optional quality gate (fail on policy-severity); uncomment as needed:
           # blackducksca_scan_failure_severities: 'BLOCKER,CRITICAL'
-          # Optional PR comments (requires token):
+
+          # Optional: PR comments (requires token)
           # blackducksca_prcomment_enabled: true
           # github_token: ${{ secrets.GITHUB_TOKEN }}
-          # Optional SARIF export & upload:
+
+          # Optional: SARIF creation & upload (requires token)
           # blackducksca_reports_sarif_create: true
           # blackducksca_upload_sarif_report: true
           # github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -85,7 +83,6 @@ migrate_cli() {
   msg "Migrating (CLI Polaris→CLI Black Duck SCA): $f"
   cp -f "$f" "$f.bak"
 
-  # Replace polaris CLI step block; create a clean BD CLI job.
   # Preserve triggers if present.
   awk '
     BEGIN{print "---"}
@@ -118,7 +115,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .ci-tools
-          # Download from your approved mirror and save as .ci-tools/bridge-cli
+          # TODO: Download from your approved mirror and save as .ci-tools/bridge-cli
           # Example (placeholder):
           # curl -fL "<APPROVED_URL>/bridge-cli-linux-x64" -o .ci-tools/bridge-cli
           # chmod +x .ci-tools/bridge-cli
@@ -141,6 +138,7 @@ JOBS
   changed=true
 }
 
+# --- scan and migrate ---
 shopt -s nullglob
 found_any=false
 for f in "$WORKFLOWS_DIR"/*.yml "$WORKFLOWS_DIR"/*.yaml; do
@@ -157,9 +155,21 @@ shopt -u nullglob
 
 $found_any || die "No workflow files found under $WORKFLOWS_DIR"
 
+# --- robust commit & push ---
 if $changed && [[ "${AUTO_COMMIT}" == "true" ]]; then
   msg "Committing changes"
-  git -C "$REPO_DIR" add .github/workflows/*.yml .github/workflows/*.yaml || true
+
+  # Stage only existing/changed workflow files safely
+  git -C "$REPO_DIR" add --update .github/workflows || true
+
+  (
+    shopt -s nullglob
+    wf_list=( "$WORKFLOWS_DIR"/*.yml "$WORKFLOWS_DIR"/*.yaml )
+    if (( ${#wf_list[@]} )); then
+      git -C "$REPO_DIR" add "${wf_list[@]}" || true
+    fi
+  )
+
   if ! git -C "$REPO_DIR" diff --cached --quiet; then
     git -C "$REPO_DIR" commit -m "$COMMIT_MESSAGE"
     if [[ -n "$COMMIT_BRANCH" ]]; then
