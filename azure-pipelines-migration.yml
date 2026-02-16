@@ -33,17 +33,26 @@ steps:
       exit 1
     fi
 
+    # Fresh clone of the target repo/branch we want to migrate
     rm -rf target
     echo "Cloning: ${{ parameters.repoUrl }}"
     echo "Branch:  ${{ parameters.branch }}"
     git clone --depth 1 --branch "${{ parameters.branch }}" "${{ parameters.repoUrl }}" target
+
+    # IMPORTANT: Switch into the cloned repo before changing its remote
+    cd target
+    
     git remote set-url origin "https://${GITHUB_TOKEN}@github.com/sunidhirout88-collab/blackduck_migration_test.git"
 
+    # Back to the workspace root to run the migration script that lives in the pipeline repo
+    cd "$(Build.SourcesDirectory)"
+
     chmod +x migration.sh
+    export COMMIT_BRANCH="${{ parameters.branch }}"
+    export AUTO_COMMIT="true"
+
+    # Run migration pointing it at the cloned repo directory
     bash migration.sh "$(Build.SourcesDirectory)/target"
   displayName: "Clone repo and run migration (commit & push)"
   env:
-    # Secret PAT for GitHub push (Azure DevOps recommends secret vars over CLI args) [1](https://www.geeksforgeeks.org/python/how-to-define-and-call-a-function-in-python/)
     GITHUB_TOKEN: $(GITHUB_TOKEN)
-    # Needed so the script knows which branch to push to
-    TARGET_BRANCH: ${{ parameters.branch }}
